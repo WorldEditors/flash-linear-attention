@@ -1,15 +1,13 @@
-# -*- coding: utf-8 -*-
-
-from typing import Optional
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import torch
 import triton
 import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
-from fla.utils import get_multiprocessor_count, input_guard, is_amd
+from fla.utils import IS_AMD, autotune_cache_kwargs, get_multiprocessor_count, input_guard
 
-NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [2, 4, 8, 16, 32]
+NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
 
 
 @torch.jit.script
@@ -24,7 +22,8 @@ def k_update_ref(k: torch.Tensor, a: torch.Tensor, ka: torch.Tensor) -> torch.Te
         for w in NUM_WARPS_AUTOTUNE
         for s in [1, 2, 3]
     ],
-    key=['BD']
+    key=['BD'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def k_update_fwd_kernel_short(
@@ -66,7 +65,8 @@ def k_update_fwd_kernel_short(
         for w in NUM_WARPS_AUTOTUNE
         for s in [1, 2, 3]
     ],
-    key=['BD', 'BT']
+    key=['BD', 'BT'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def k_update_fwd_kernel_long(
@@ -112,7 +112,8 @@ def k_update_fwd_kernel_long(
         for s in [1, 2, 3]
         for BT in [2, 4, 8]
     ],
-    key=['BD']
+    key=['BD'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def k_update_bwd_kernel_short(
@@ -163,7 +164,8 @@ def k_update_bwd_kernel_short(
         for w in NUM_WARPS_AUTOTUNE
         for s in [1, 2, 3]
     ],
-    key=['BD', 'BT']
+    key=['BD', 'BT'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def k_update_bwd_kernel_long(
@@ -210,7 +212,7 @@ def k_update_fwd(
     k: torch.Tensor,
     a: torch.Tensor,
     ka: torch.Tensor,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, D = k.shape
     out = torch.empty_like(k)
@@ -231,7 +233,7 @@ def k_update_fwd(
         )
     else:
         BT = min(64, triton.next_power_of_2(
-            triton.cdiv(max(16, B * T), get_multiprocessor_count(k.device.index))
+            triton.cdiv(max(16, B * T), get_multiprocessor_count(k.device.index)),
         ))
         if cu_seqlens is not None:
             chunk_idx = prepare_chunk_indices(cu_seqlens, BT)
@@ -262,7 +264,7 @@ def k_update_bwd(
     k: torch.Tensor,
     a: torch.Tensor,
     ka: torch.Tensor,
-    cu_seqlens: Optional[torch.Tensor],
+    cu_seqlens: torch.Tensor | None,
     use_short: bool,
     N: int,
     T: int,
@@ -284,7 +286,7 @@ def k_update_bwd(
         )
     else:
         BT = min(64, triton.next_power_of_2(
-            triton.cdiv(max(16, B * T), get_multiprocessor_count(grad_out.device.index))
+            triton.cdiv(max(16, B * T), get_multiprocessor_count(grad_out.device.index)),
         ))
         if cu_seqlens is not None:
             chunk_idx = prepare_chunk_indices(cu_seqlens, BT)

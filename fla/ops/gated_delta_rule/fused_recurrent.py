@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -17,7 +15,7 @@ from fla.utils import input_guard
     'USE_GV': lambda args: args['gv'] is not None,
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.jit(do_not_specialize=['T'])
 def fused_recurrent_gated_delta_rule_fwd_kernel(
@@ -53,6 +51,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
+
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
@@ -140,23 +139,22 @@ def fused_recurrent_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    gk: Optional[torch.Tensor] = None,
-    gv: Optional[torch.Tensor] = None,
-    beta: Optional[torch.Tensor] = None,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    gv: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
     scale: float = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 8)
+    BK = triton.next_power_of_2(K)
+    BV = min(8, triton.next_power_of_2(V)) if gv is None else triton.next_power_of_2(V)
     NV = triton.cdiv(V, BV)
-    num_stages = 3
-    num_warps = 1
 
     o = torch.empty_like(v)
     final_state = q.new_empty(N, HV, K, V, dtype=torch.float32) if output_final_state else None
@@ -185,8 +183,8 @@ def fused_recurrent_gated_delta_rule_fwd(
         BV=BV,
         IS_BETA_HEADWISE=beta.ndim != v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=1,
+        num_stages=3,
     )
     return o, final_state
 
@@ -200,15 +198,15 @@ class FusedRecurrentFunction(torch.autograd.Function):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        g: Optional[torch.Tensor] = None,
-        gk: Optional[torch.Tensor] = None,
-        gv: Optional[torch.Tensor] = None,
-        beta: Optional[torch.Tensor] = None,
+        g: torch.Tensor | None = None,
+        gk: torch.Tensor | None = None,
+        gv: torch.Tensor | None = None,
+        beta: torch.Tensor | None = None,
         scale: float = None,
         initial_state: torch.Tensor = None,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
-        cu_seqlens: Optional[torch.LongTensor] = None,
+        cu_seqlens: torch.LongTensor | None = None,
     ):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q,
@@ -233,7 +231,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         raise NotImplementedError(
             "Backward pass is not implemented yet and we do not have plans to implement it "
             "because we haven't figured out how to compute dg without materializing the full "
-            "hidden states for all time steps."
+            "hidden states for all time steps.",
         )
 
 
@@ -241,16 +239,16 @@ def fused_recurrent_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    gk: Optional[torch.Tensor] = None,
-    gv: Optional[torch.Tensor] = None,
-    beta: Optional[torch.Tensor] = None,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    gv: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
     scale: float = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
         q (torch.Tensor):
@@ -322,12 +320,12 @@ def fused_recurrent_gated_delta_rule(
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing."
+                f"Please flatten variable-length inputs before processing.",
             )
         if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
+                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5

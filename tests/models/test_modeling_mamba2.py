@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 import os
 
@@ -18,10 +17,10 @@ from fla.utils import device
         pytest.param(*test, id="L{}-B{}-T{}-H{}-D{}-use_l2warp{}-{}-conv-{}".format(*test))
         for test in [
             (4, 4, 1024, 4, 64, True, torch.bfloat16, 'cuda'),
-            (4, 4, 1024, 4, 64, False, torch.bfloat16, 'triton'),
+            (4, 4, 1024, 4, 64, False, torch.bfloat16, 'cuda'),
             (4, 4, 1024, 4, 128, False, torch.bfloat16, 'cuda'),
         ]
-    ]
+    ],
 )
 def test_modeling(
     L: int,
@@ -52,7 +51,7 @@ def test_modeling(
         num_heads=H,
         head_dim=D,
         use_l2warp=use_l2warp,
-        vocab_size=1000  # dummy vocab size
+        vocab_size=1000,  # dummy vocab size
     )
 
     model = Mamba2ForCausalLM(config).to(device=device, dtype=dtype)

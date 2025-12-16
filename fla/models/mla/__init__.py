@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from fla.models.mla.configuration_mla import MLAConfig
@@ -10,6 +8,4 @@ AutoModel.register(MLAConfig, MLAModel, exist_ok=True)
 AutoModelForCausalLM.register(MLAConfig, MLAForCausalLM, exist_ok=True)
 
 
-__all__ = [
-    'MLAConfig', 'MLAModel', 'MLAForCausalLM',
-]
+__all__ = ['MLAConfig', 'MLAForCausalLM', 'MLAModel']
