@@ -1,101 +1,94 @@
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
-from transformers.activations import ACT2FN
-from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, logging
+from transformers.utils.deprecation import deprecate_kwarg
 
 from fla.layers.attn import Attention
-from fla.models.mamba.modeling_mamba import MambaCache, MambaMixer
+from fla.layers.mamba import Mamba
+from fla.models.mamba.modeling_mamba import MambaCache
 from fla.models.samba.configuration_samba import SambaConfig
-from fla.modules import (FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss,
-                         RMSNorm)
-from fla.modules.activations import swiglu_linear
+from fla.models.utils import FLAGenerationMixin
+from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
+from fla.modules import GatedMLP as SambaMLP
+from fla.modules.l2warp import l2_warp
+
+if TYPE_CHECKING:
+    from transformers.processing_utils import Unpack
+
+
+try:
+    from transformers.modeling_layers import GradientCheckpointingLayer
+except ImportError:
+    from fla.models.modeling_layers import GradientCheckpointingLayer
 
 logger = logging.get_logger(__name__)
 
 
-class SambaMLP(nn.Module):
+class SambaBlock(GradientCheckpointingLayer):
 
-    def __init__(
-        self,
-        hidden_size: int,
-        hidden_ratio: Optional[int] = None,
-        hidden_act: str = 'swish'
-    ) -> SambaMLP:
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        # the final number of params is `hidden_ratio * hidden_size^2`
-        # `intermediate_size` is chosen to be a multiple of 256 closest to `2/3 * hidden_size * hidden_ratio`
-        if hidden_ratio is None:
-            hidden_ratio = 4
-        self.hidden_ratio = hidden_ratio
-
-        self.intermediate_size = int(hidden_size * hidden_ratio * 2 / 3)
-        self.intermediate_size = 256 * ((self.intermediate_size + 256 - 1) // 256)
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size * 2, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[hidden_act]
-
-    def forward(self, x):
-        y = self.gate_proj(x)
-        gate, y = y.chunk(2, -1)
-        return swiglu_linear(gate, y, self.down_proj.weight, self.down_proj.bias)
-
-
-class SambaBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
 
         self.config = config
-        self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
 
-        self.mixer_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        self.mixer_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps, dtype=torch.float32)
         if config.attn is not None and layer_idx in config.attn['layers']:
             self.mixer = Attention(
                 hidden_size=config.hidden_size,
                 num_heads=config.attn['num_heads'],
                 num_kv_heads=config.attn['num_kv_heads'],
+                qkv_bias=config.attn['qkv_bias'],
                 window_size=config.attn['window_size'],
+                rope_theta=config.attn['rope_theta'],
                 max_position_embeddings=config.max_position_embeddings,
-                layer_idx=layer_idx
+                layer_idx=layer_idx,
             )
         else:
-            self.mixer = MambaMixer(config, layer_idx=layer_idx)
-        self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+            self.mixer = Mamba(
+                hidden_size=config.hidden_size,
+                state_size=config.state_size,
+                conv_kernel=config.conv_kernel,
+                intermediate_size=config.intermediate_size,
+                time_step_rank=config.time_step_rank,
+                use_bias=config.use_bias,
+                layer_idx=layer_idx,
+            )
+        self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = SambaMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
-            hidden_act=config.hidden_act
+            hidden_act=config.hidden_act,
+            fuse_swiglu=config.fuse_swiglu,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Optional[Tuple[torch.Tensor]] = None,
-        **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        cache_params: tuple[torch.Tensor] | None = None,
+        **kwargs: Unpack[dict],
+    ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
 
         residual = hidden_states
         hidden_states = self.mixer_norm(hidden_states)
-        if isinstance(self.mixer, MambaMixer):
-            hidden_states = self.mixer(hidden_states, cache_params=cache_params)
+        if isinstance(self.mixer, Mamba):
+            hidden_states = self.mixer(hidden_states, cache_params=cache_params, **kwargs)
         else:
-            hidden_states, _, cache_params = self.mixer(hidden_states=hidden_states, past_key_values=cache_params)
-        hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
-        hidden_states = self.mlp(hidden_states)
+            hidden_states, _, cache_params = self.mixer(hidden_states=hidden_states, past_key_values=cache_params, **kwargs)
+        if self.config.fuse_norm:
+            hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.mlp_norm(hidden_states)
+        hidden_states = self.mlp(hidden_states, **kwargs)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -113,7 +106,12 @@ class SambaPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         """Initialize the weights."""
-        if isinstance(module, MambaMixer):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                if not getattr(module.bias, "_no_reinit", False):
+                    nn.init.zeros_(module.bias)
+        elif isinstance(module, Mamba):
             module.A_log._no_weight_decay = True
             module.D._no_weight_decay = True
 
@@ -126,20 +124,17 @@ class SambaPreTrainedModel(PreTrainedModel):
             dt = torch.exp(
                 torch.rand(self.config.intermediate_size)
                 * (math.log(self.config.time_step_max) - math.log(self.config.time_step_min))
-                + math.log(self.config.time_step_min)
+                + math.log(self.config.time_step_min),
             ).clamp(min=self.config.time_step_floor)
             # # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             with torch.no_grad():
-                module.dt_proj.bias.copy_(inv_dt)
+                module.dt_proj.bias.data = nn.Parameter(inv_dt.to(module.dt_proj.bias.device))
             module.dt_proj.bias._no_reinit = True
-
-        if isinstance(module, nn.Linear):
-            if module.bias is not None:
-                if not getattr(module.bias, "_no_reinit", False):
-                    nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=self.config.initializer_range)
+        elif hasattr(module, 'reset_parameters'):
+            module.reset_parameters()
 
         if self.config.rescale_prenorm_residual:
             # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
@@ -180,9 +175,9 @@ class SambaOutput(ModelOutput):
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
     """
 
-    last_hidden_state: Optional[torch.FloatTensor] = None
-    cache_params: Optional[MambaCache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    last_hidden_state: torch.FloatTensor | None = None
+    cache_params: MambaCache | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
 
 
 @dataclass
@@ -208,10 +203,10 @@ class SambaCausalLMOutput(ModelOutput):
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
     """
 
-    loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    cache_params: Optional[MambaCache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    cache_params: MambaCache | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
 
 
 class SambaModel(SambaPreTrainedModel):
@@ -222,7 +217,7 @@ class SambaModel(SambaPreTrainedModel):
         self.layers = nn.ModuleList([SambaBlock(config, layer_idx=idx) for idx in range(config.num_hidden_layers)])
 
         self.gradient_checkpointing = False
-        self.norm_f = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm_f = RMSNorm(config.hidden_size, eps=config.norm_eps, dtype=torch.float32)
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -234,14 +229,14 @@ class SambaModel(SambaPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.LongTensor] = None,
-        cache_params: Optional[MambaCache] = None,
-        use_cache: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs,  # `attention_mask` is passed by the tokenizer and we don't want it
-    ) -> Union[Tuple, SambaOutput]:
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.LongTensor | None = None,
+        cache_params: MambaCache | None = None,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs: Unpack[dict],
+    ) -> tuple | SambaOutput:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -250,27 +245,25 @@ class SambaModel(SambaPreTrainedModel):
 
         if (input_ids is None) ^ (inputs_embeds is not None):  # ^ is python for xor
             raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one",
             )
 
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
 
-        if self.gradient_checkpointing and self.training and use_cache:
-            use_cache = False
-
         if cache_params is None and use_cache:
             cache_params = MambaCache(
-                self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype,
             )
 
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
         for mixer_block in self.layers:
-            if self.gradient_checkpointing and self.training:
-                hidden_states = self._gradient_checkpointing_func(mixer_block.__call__, hidden_states, cache_params)
-            else:
-                hidden_states = mixer_block(hidden_states, cache_params=cache_params)
+            hidden_states = mixer_block(
+                hidden_states,
+                cache_params=cache_params,
+                **kwargs,
+            )
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -293,7 +286,7 @@ class SambaModel(SambaPreTrainedModel):
         )
 
 
-class SambaForCausalLM(SambaPreTrainedModel, GenerationMixin):
+class SambaForCausalLM(SambaPreTrainedModel, FLAGenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -301,6 +294,8 @@ class SambaForCausalLM(SambaPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.backbone = SambaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.criterion = None
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -317,55 +312,25 @@ class SambaForCausalLM(SambaPreTrainedModel, GenerationMixin):
         return self.backbone.set_input_embeddings(new_embeddings)
 
     def _update_model_kwargs_for_generation(
-        self, outputs: ModelOutput, model_kwargs: Dict[str, Any], **kwargs
-    ) -> Dict[str, Any]:
+        self, outputs: ModelOutput, model_kwargs: dict[str, Any], **kwargs,
+    ) -> dict[str, Any]:
         model_kwargs["cache_params"] = outputs.get("cache_params", None)
         return model_kwargs
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        cache_params:
-        Optional[MambaCache] = None,
-        inputs_embeds=None,
-        attention_mask=None,
-        use_cache: Optional[bool] = True,
-        num_logits_to_keep: Optional[int] = None,
-        **kwargs
-    ):
-        # only last token for inputs_ids if the state is passed along.
-        if cache_params is not None:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-
-        if inputs_embeds is not None and cache_params is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        if num_logits_to_keep is not None:
-            model_inputs['num_logits_to_keep'] = num_logits_to_keep
-
-        model_inputs.update({
-            'cache_params': cache_params,
-            'use_cache': use_cache,
-            'attention_mask': attention_mask,
-            'num_logits_to_keep': num_logits_to_keep,
-        })
-        return model_inputs
-
+    @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
         attention_mask: Optional[torch.Tensor] = None,  # noqa
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_params: Optional[MambaCache] = None,
-        labels: Optional[torch.LongTensor] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        use_cache: Optional[bool] = None,
-        num_logits_to_keep: Optional[int] = 0,
-        **kwargs,  # for now we need this for generation
-    ) -> Union[Tuple, SambaCausalLMOutput]:
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_params: MambaCache | None = None,
+        labels: torch.LongTensor | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = 0,
+        **kwargs: Unpack[dict],
+    ) -> tuple | SambaCausalLMOutput:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
@@ -374,45 +339,45 @@ class SambaForCausalLM(SambaPreTrainedModel, GenerationMixin):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        samba_outputs = self.backbone(
+        outputs = self.backbone(
             input_ids,
             cache_params=cache_params,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             use_cache=use_cache,
+            **kwargs,
         )
-        hidden_states = samba_outputs[0]
-        fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
-        logits = None if fuse_linear_and_cross_entropy else self.lm_head(hidden_states[:, -num_logits_to_keep:])
+        hidden_states = outputs[0]
 
-        loss = None
+        loss, logits = None, None
+        if not self.config.fuse_linear_cross_entropy or labels is None:
+            logits = self.lm_head(hidden_states if logits_to_keep is None else hidden_states[:, -logits_to_keep:])
         if labels is not None:
-            if self.config.fuse_cross_entropy:
-                if fuse_linear_and_cross_entropy:
-                    loss_fct = FusedLinearCrossEntropyLoss()
+            if getattr(self, 'criterion', None) is None:
+                if self.config.fuse_linear_cross_entropy:
+                    criterion = FusedLinearCrossEntropyLoss(use_l2warp=self.config.use_l2warp)
+                elif self.config.fuse_cross_entropy:
+                    criterion = FusedCrossEntropyLoss(inplace_backward=True)
                 else:
-                    loss_fct = FusedCrossEntropyLoss(inplace_backward=True)
+                    criterion = nn.CrossEntropyLoss()
             else:
-                loss_fct = nn.CrossEntropyLoss()
-            # Enable model parallelism
+                criterion = self.criterion
             labels = labels.to(hidden_states.device)
-            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], loss_fct.ignore_index)), 1)
-            if fuse_linear_and_cross_entropy:
-                loss = loss_fct(hidden_states.view(-1, self.config.hidden_size),
-                                labels.view(-1),
-                                self.lm_head.weight,
-                                self.lm_head.bias)
+            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
+            if self.config.fuse_linear_cross_entropy:
+                loss = criterion(hidden_states, labels, self.lm_head.weight, self.lm_head.bias)
             else:
-                loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+                loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
+                loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
 
         if not return_dict:
-            output = (logits,) + samba_outputs[1:]
+            output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
         return SambaCausalLMOutput(
             loss=loss,
             logits=logits,
-            cache_params=samba_outputs.cache_params,
-            hidden_states=samba_outputs.hidden_states,
+            cache_params=outputs.cache_params,
+            hidden_states=outputs.hidden_states,
         )

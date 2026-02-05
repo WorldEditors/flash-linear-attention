@@ -1,24 +1,34 @@
-# -*- coding: utf-8 -*-
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 # Code adapted from
 # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/fused_linear_cross_entropy.py
 
-from typing import Optional, Tuple
+from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Replicate, Shard, distribute_module
+from torch.distributed.tensor.parallel import ParallelStyle
 
 from fla.ops.utils import logsumexp_fwd
-from fla.utils import contiguous
+from fla.ops.utils.op import exp
+from fla.utils import IS_AMD, input_guard
+
+try:
+    from torch.distributed.tensor import DTensor
+except (ImportError, AttributeError):
+    DTensor = None
 
 # The hard limit of TRITON_MAX_TENSOR_NUMEL is 1048576
 # https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/language/core.py#L19
 # However, setting limit as 65536 as in LayerNorm tutorial is faster because of less register spilling
 # The optimal maximum block size depends on your hardware, your kernel, and your dtype
 MAX_FUSED_SIZE = 65536 // 2
+STATIC_WARPS = 32 if not IS_AMD else 16
 
 
 @triton.jit
@@ -33,7 +43,7 @@ def cross_entropy_kernel(
     logit_scale: tl.constexpr,
     reduction: tl.constexpr,
     V: tl.constexpr,
-    BV: tl.constexpr
+    BV: tl.constexpr,
 ):
     """
     This kernel computes both cross entropy loss and the gradient of the input.
@@ -115,7 +125,7 @@ def cross_entropy_kernel(
         if label_smoothing > 0:
             # scale X beforehand to avoid overflow
             b_z += tl.sum(tl.where(o_v < V, -eps * b_logits, 0.0))
-        b_p = (tl.exp(b_logits - b_lse) - eps) * logit_scale
+        b_p = (exp(b_logits - b_lse) - eps) * logit_scale
         if reduction == "mean":
             b_p = b_p / total
         tl.store(logits + o_v, b_p, mask=o_v < V)
@@ -154,7 +164,7 @@ def elementwise_mul_kernel(
     x,
     g,
     N: tl.constexpr,
-    B: tl.constexpr
+    B: tl.constexpr,
 ):
     """
     This function multiplies each element of the tensor pointed by x with the value pointed by g.
@@ -190,10 +200,11 @@ def fused_linear_cross_entropy_forward(
     label_smoothing: float = 0.0,
     logit_scale: float = 1.0,
     num_chunks: int = 8,
-    reduction: str = "mean"
+    reduction: str = "mean",
+    use_l2warp: bool = False,
+    l2_penalty_factor: float = 1e-4,
 ):
     device = x.device
-
     # inputs have shape: [N, H]
     # materialized activations will have shape: [N, V]
     # the increase in memory = [N, V]
@@ -212,11 +223,14 @@ def fused_linear_cross_entropy_forward(
     C = triton.next_power_of_2(triton.cdiv(N, NC))
     NC = triton.cdiv(N, C)
 
+    # [N, H]
     dx = torch.zeros_like(x, device=device)
-    dw = torch.zeros_like(weight, device=device) if weight is not None else None
-    db = torch.zeros_like(bias, device=device) if bias is not None else None
-    # we use fp32 for loss accumulator
-    loss = torch.zeros(N, dtype=torch.float32, device=device)
+    # [V, H]
+    dw = torch.zeros_like(weight, device=device, dtype=torch.float) if weight is not None else None
+    # [V]
+    db = torch.zeros_like(bias, device=device, dtype=torch.float) if bias is not None else None
+    # [N]
+    loss = torch.zeros(N, device=device, dtype=torch.float)
 
     total = target.ne(ignore_index).sum().item()
 
@@ -234,6 +248,8 @@ def fused_linear_cross_entropy_forward(
 
         # unreduced loss
         c_loss = loss[start:end]
+        if use_l2warp:
+            c_maxx, c_ids = torch.max(c_logits, -1, keepdim=True)
 
         # Here we calculate the gradient of c_logits in place so we can save memory.
         cross_entropy_kernel[(c_logits.shape[0],)](
@@ -248,12 +264,34 @@ def fused_linear_cross_entropy_forward(
             reduction=reduction,
             V=V,
             BV=BV,
-            num_warps=32
+            num_warps=STATIC_WARPS,
         )
+        if use_l2warp:
+            # a. Calculate the L2 gradient w.r.t logits (g_logits_l2)
+            g_logits_l2 = torch.zeros_like(c_logits)
+
+            # Normalize factor by B*T, which is the 'total' variable here
+            l2_factor = l2_penalty_factor / total if reduction == 'mean' else l2_penalty_factor
+            penalty_grad = c_maxx * l2_factor
+            g_logits_l2.scatter_(-1, c_ids, penalty_grad)
+
+            # b. Backpropagate g_logits_l2 to get its effect on dx, dw, db
+            # and add it to the main gradients.
+            # Total_dx = CE_dx + L2_dx
+            # Total_dw = CE_dw + L2_dw
+            # Total_db = CE_db + L2_db
+            if weight is not None:
+                dw.add_(g_logits_l2.t() @ c_x)
+            if bias is not None:
+                db.add_(g_logits_l2.sum(0))
+            # The dx contribution must be added to the final dx calculation
+            dx_l2_contribution = torch.mm(g_logits_l2, weight)
+        else:
+            dx_l2_contribution = 0.0
 
         # gradient of logits is computed in-place by the above triton kernel and is of shape: C x V
         # thus dx should be of shape: C x H
-        dx[start:end] = torch.mm(c_logits, weight)
+        dx[start:end] = torch.mm(c_logits, weight) + dx_l2_contribution
 
         # keep dw in fp32 to maintain precision
         if weight is not None:
@@ -274,7 +312,7 @@ def fused_linear_cross_entropy_backward(
     do: torch.Tensor,
     dx: torch.Tensor,
     dw: torch.Tensor,
-    db: torch.Tensor
+    db: torch.Tensor,
 ):
     # If cross entropy is the last layer, do is 1.0. Skip the mul to save time
     if torch.ne(do, torch.tensor(1.0, device=do.device)):
@@ -288,7 +326,7 @@ def fused_linear_cross_entropy_backward(
             g=do,
             N=N*H,
             B=B,
-            num_warps=32,
+            num_warps=STATIC_WARPS,
         )
 
         # handle dw
@@ -299,7 +337,7 @@ def fused_linear_cross_entropy_backward(
                 g=do,
                 N=V*H,
                 B=B,
-                num_warps=32,
+                num_warps=STATIC_WARPS,
             )
 
         if db is not None:
@@ -309,7 +347,7 @@ def fused_linear_cross_entropy_backward(
                 g=do,
                 N=V,
                 B=B,
-                num_warps=32,
+                num_warps=STATIC_WARPS,
             )
     return dx, dw, db
 
@@ -317,7 +355,7 @@ def fused_linear_cross_entropy_backward(
 class FusedLinearCrossEntropyFunction(torch.autograd.Function):
 
     @staticmethod
-    @contiguous
+    @input_guard
     def forward(
         ctx,
         x: torch.Tensor,
@@ -328,7 +366,9 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
         label_smoothing: float = 0.0,
         logit_scale: float = 1.0,
         num_chunks: int = 8,
-        reduction: str = "mean"
+        reduction: str = "mean",
+        use_l2warp: bool = False,
+        l2_penalty_factor: float = 1e-4,
     ):
         """
         Fusing the last linear layer with cross-entropy loss
@@ -361,6 +401,10 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
             'mean': the weighted mean of the output is taken,
             'sum': the output will be summed.
             Default: 'mean'.
+        use_l2warp: bool = False,
+            Whether to use L2 regularization on the logits to prevent overconfidence.
+            Default: False
+        l2_penalty_factor: float = 1e-4,
         """
         loss, dx, dw, db = fused_linear_cross_entropy_forward(
             x,
@@ -371,7 +415,9 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
             label_smoothing,
             logit_scale,
             num_chunks,
-            reduction
+            reduction,
+            use_l2warp,
+            l2_penalty_factor,
         )
         # downcast to dtype and store for backward
         ctx.save_for_backward(
@@ -382,11 +428,11 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
         return loss
 
     @staticmethod
-    @contiguous
+    @input_guard
     def backward(ctx, do):
         dx, dw, db = ctx.saved_tensors
         dx, dw, db = fused_linear_cross_entropy_backward(do, dx, dw, db)
-        return dx, None, dw, db, None, None, None, None, None
+        return dx, None, dw, db, None, None, None, None, None, None, None
 
 
 def fused_linear_cross_entropy_loss(
@@ -398,8 +444,10 @@ def fused_linear_cross_entropy_loss(
     label_smoothing: float = 0.0,
     logit_scale: float = 1.0,
     num_chunks: int = 8,
-    reduction: str = "mean"
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    reduction: str = "mean",
+    use_l2warp: bool = False,
+    l2_penalty_factor: float = 1e-4,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args:
         x (torch.Tensor): [batch_size * seq_len, hidden_size]
@@ -435,7 +483,9 @@ def fused_linear_cross_entropy_loss(
         label_smoothing,
         logit_scale,
         num_chunks,
-        reduction
+        reduction,
+        use_l2warp,
+        l2_penalty_factor,
     )
 
 
@@ -447,7 +497,9 @@ class FusedLinearCrossEntropyLoss(nn.Module):
         label_smoothing: float = 0.0,
         logit_scale: float = 1.0,
         num_chunks: int = 8,
-        reduction: str = "mean"
+        reduction: str = "mean",
+        use_l2warp: bool = False,
+        l2_penalty_factor: float = 1e-4,
     ):
         """
         Args:
@@ -468,25 +520,28 @@ class FusedLinearCrossEntropyLoss(nn.Module):
         """
         super().__init__()
 
-        assert reduction in ["none", "mean", "sum"], f"reduction: {reduction} is not supported"
+        assert reduction in ["mean", "sum"], f"reduction: {reduction} is not supported"
 
         self.ignore_index = ignore_index
         self.label_smoothing = label_smoothing
         self.logit_scale = logit_scale
         self.num_chunks = num_chunks
         self.reduction = reduction
+        self.use_l2warp = use_l2warp
+        self.l2_penalty_factor = l2_penalty_factor
 
+    @torch.compiler.disable
     def forward(
         self,
         x: torch.Tensor,
         target: torch.LongTensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None
+        bias: torch.Tensor | None = None,
     ):
         """
         Args:
-            x (torch.Tensor): [batch_size * seq_len, hidden_size]
-            target (torch.LongTensor): [batch_size * seq_len]
+            x (torch.Tensor): [batch_size, seq_len, hidden_size]
+            target (torch.LongTensor): [batch_size, seq_len]
                 where each value is in [0, V).
             weight (torch.Tensor): [vocab_size, hidden_size]
                 where `vocab_size` is the number of classes.
@@ -496,14 +551,69 @@ class FusedLinearCrossEntropyLoss(nn.Module):
             loss
         """
         loss = fused_linear_cross_entropy_loss(
-            x,
-            target,
+            x.view(-1, x.shape[-1]),
+            target.view(-1),
             weight=weight,
             bias=bias,
             ignore_index=self.ignore_index,
             label_smoothing=self.label_smoothing,
             logit_scale=self.logit_scale,
             num_chunks=self.num_chunks,
-            reduction=self.reduction
+            reduction=self.reduction,
+            use_l2warp=self.use_l2warp,
+            l2_penalty_factor=self.l2_penalty_factor,
         )
         return loss
+
+
+class LinearLossParallel(ParallelStyle):
+    def __init__(
+        self,
+        *,
+        sequence_dim: int = 1,
+        use_local_output: bool = False,
+    ):
+        super().__init__()
+
+        self.sequence_sharding = (Shard(sequence_dim),)
+        self.use_local_output = use_local_output
+
+    @staticmethod
+    def _prepare_input_fn(sequence_sharding, mod, inputs, device_mesh):
+        x, target, weight, bias = inputs
+
+        if not isinstance(x, DTensor):
+            # assume the input passed in already sharded on the sequence dim and create the DTensor
+            x = DTensor.from_local(x, device_mesh, sequence_sharding)
+        if x.placements != sequence_sharding:
+            x = x.redistribute(placements=sequence_sharding, async_op=True)
+        if not isinstance(target, DTensor):
+            target = DTensor.from_local(target, device_mesh, [Replicate()])
+        if target.placements != sequence_sharding:
+            target = target.redistribute(placements=sequence_sharding, async_op=True)
+
+        if not isinstance(weight, DTensor):
+            weight = DTensor.from_local(weight, device_mesh, [Replicate()])
+        if weight.placements != [Replicate()]:
+            # we replicate the weight/bias in FLCE
+            weight = weight.redistribute(placements=[Replicate()], async_op=True)
+
+        if bias is not None and not isinstance(bias, DTensor):
+            bias = DTensor.from_local(bias, device_mesh, [Replicate()])
+        if bias is not None and bias.placements != [Replicate()]:
+            bias = bias.redistribute(placements=[Replicate()], async_op=True)
+
+        return x.to_local(), target.to_local(), weight.to_local(), bias.to_local() if bias is not None else bias
+
+    @staticmethod
+    def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
+        return outputs.to_local() if use_local_output else outputs
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        return distribute_module(
+            module,
+            device_mesh,
+            partition_fn=None,
+            input_fn=partial(self._prepare_input_fn, self.sequence_sharding),
+            output_fn=partial(self._prepare_output_fn, self.use_local_output),
+        )

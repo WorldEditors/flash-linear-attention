@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 import torch
 import triton
@@ -36,27 +35,24 @@ except BaseException:
         # name for the plot. Used also as a file name for saving the plot.
         plot_name="Performance",
         args={},
-    )
+    ),
 )
 def benchmark(T, provider):
-    device = 'cuda'
+    from fla.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     B, H, D, M = 16, 4, 128, 64
 
-    q = torch.randn(B, H, T, D, device=device, requires_grad=requires_grad, dtype=dtype)
-    k = torch.randn(B, H, T, D, device=device, requires_grad=requires_grad, dtype=dtype)
-    v = torch.randn(B, H, T, D, device=device, requires_grad=requires_grad, dtype=dtype)
+    q = torch.randn(B, T, H, D, device=device, requires_grad=requires_grad, dtype=dtype)
+    k = torch.randn(B, T, H, D, device=device, requires_grad=requires_grad, dtype=dtype)
+    v = torch.randn(B, T, H, D, device=device, requires_grad=requires_grad, dtype=dtype)
     if provider.startswith('gsa'):
-        f = F.logsigmoid(torch.randn(B, H, T, M, device=device, dtype=dtype))
+        f = F.logsigmoid(torch.randn(B, T, H, M, device=device, dtype=dtype))
         s = (1 - f.exp()).to(f.dtype)
     if provider.startswith('gla'):
-        g = F.logsigmoid(torch.randn(B, H, T, D, device=device, dtype=dtype))
+        g = F.logsigmoid(torch.randn(B, T, H, D, device=device, dtype=dtype))
         g = g.clamp_min(-5).requires_grad_(requires_grad)
-    if provider.startswith('flash'):
-        q = torch.randn(B, T, H, D, device=device, requires_grad=requires_grad, dtype=dtype)
-        k = torch.randn(B, T, H, D, device=device, requires_grad=requires_grad, dtype=dtype)
-        v = torch.randn(B, T, H, D, device=device, requires_grad=requires_grad, dtype=dtype)
+
     do = torch.ones_like(v, dtype=dtype)
 
     quantiles = [0.5, 0.2, 0.8]

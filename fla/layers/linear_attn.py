@@ -1,38 +1,35 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2024, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from fla.modules import RMSNorm
-from fla.modules.feature_map import (DPFPFeatureMap, HadamardFeatureMap,
-                                     HedgehogFeatureMap, T2RFeatureMap)
-from fla.ops.linear_attn import (chunk_linear_attn, fused_chunk_linear_attn,
-                                 fused_recurrent_linear_attn)
+from fla.modules.feature_map import DPFPFeatureMap, HadamardFeatureMap, HedgehogFeatureMap, T2RFeatureMap
+from fla.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
 
 
 class LinearAttention(nn.Module):
+
     def __init__(
         self,
         mode: str = 'chunk',
         hidden_size: str = 1024,
-        expand_k: int = 1.0,
-        expand_v: int = 1.0,
+        expand_k: float = 1.0,
+        expand_v: float = 1.0,
         num_heads: int = 8,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         feature_map: str = 'elementwise_product',
         tie_feature_map_qk: bool = False,
         output_norm: str = 'rmsnorm',
         norm_q: bool = False,
         norm_k: bool = False,
-        # standard linear attention normalization
         do_feature_map_norm: bool = False,
         elementwise_affine: bool = True,
         norm_eps: float = 1e-5,
-        **kwargs
+        **kwargs,
     ):
         super().__init__()
 
@@ -46,38 +43,38 @@ class LinearAttention(nn.Module):
         self.key_dim_per_group = self.key_dim // self.num_kv_groups
         self.value_dim_per_group = self.value_dim // self.num_kv_groups
 
-        assert mode in ['chunk', 'fused_chunk', 'fused_recurrent'], f"Not suppoerted mode `{mode}`."
+        assert mode in ['chunk', 'fused_chunk', 'fused_recurrent'], f"Not supported mode `{mode}`."
         assert self.key_dim % num_heads == 0, f"key dim must be divisible by num_heads of {num_heads}"
         assert self.value_dim % num_heads == 0, f"value dim must be divisible by num_heads of {num_heads}"
 
-        self.head_qk_dim = self.key_dim // num_heads
+        self.head_k_dim = self.key_dim // num_heads
         self.head_v_dim = self.value_dim // num_heads
         self.do_feature_map_norm = do_feature_map_norm
 
         if feature_map == 'hedgehog':
             if tie_feature_map_qk:
-                self.feature_map_q = self.feature_map_k = HedgehogFeatureMap(head_dim=self.head_qk_dim)
+                self.feature_map_q = self.feature_map_k = HedgehogFeatureMap(head_dim=self.head_k_dim)
             else:
-                self.feature_map_q = HedgehogFeatureMap(head_dim=self.head_qk_dim)
-                self.feature_map_k = HedgehogFeatureMap(head_dim=self.head_qk_dim)
+                self.feature_map_q = HedgehogFeatureMap(head_dim=self.head_k_dim)
+                self.feature_map_k = HedgehogFeatureMap(head_dim=self.head_k_dim)
 
         elif feature_map == 't2r':
             if tie_feature_map_qk:
-                self.feature_map_q = self.feature_map_k = T2RFeatureMap(head_dim=self.head_qk_dim)
+                self.feature_map_q = self.feature_map_k = T2RFeatureMap(head_dim=self.head_k_dim)
             else:
-                self.feature_map_q = T2RFeatureMap(head_dim=self.head_qk_dim)
-                self.feature_map_k = T2RFeatureMap(head_dim=self.head_qk_dim)
+                self.feature_map_q = T2RFeatureMap(head_dim=self.head_k_dim)
+                self.feature_map_k = T2RFeatureMap(head_dim=self.head_k_dim)
 
         elif feature_map == 'elementwise_product':
             if tie_feature_map_qk:
-                self.feature_map_q = self.feature_map_k = HadamardFeatureMap(head_dim=self.head_qk_dim)
+                self.feature_map_q = self.feature_map_k = HadamardFeatureMap(head_dim=self.head_k_dim)
             else:
-                self.feature_map_q = HadamardFeatureMap(head_dim=self.head_qk_dim)
-                self.feature_map_k = HadamardFeatureMap(head_dim=self.head_qk_dim)
+                self.feature_map_q = HadamardFeatureMap(head_dim=self.head_k_dim)
+                self.feature_map_k = HadamardFeatureMap(head_dim=self.head_k_dim)
 
         elif feature_map == 'dpfp':
-            self.feature_map_q = DPFPFeatureMap(head_dim=self.head_qk_dim)
-            self.feature_map_k = DPFPFeatureMap(head_dim=self.head_qk_dim)
+            self.feature_map_q = DPFPFeatureMap(head_dim=self.head_k_dim)
+            self.feature_map_k = DPFPFeatureMap(head_dim=self.head_k_dim)
 
         elif feature_map == 'elu':
             def elu(x):
@@ -100,7 +97,7 @@ class LinearAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, self.value_dim_per_group, bias=False)
 
         if output_norm == 'rmsnorm':
-            self.norm = RMSNorm(hidden_size=self.head_v_dim, elementwise_affine=elementwise_affine, eps=norm_eps)
+            self.norm = RMSNorm(hidden_size=self.head_v_dim, elementwise_affine=elementwise_affine, eps=norm_eps, dtype=torch.float32)
         elif output_norm == 'identity':
             self.norm = nn.Identity()
         else:
@@ -111,28 +108,23 @@ class LinearAttention(nn.Module):
         self.norm_q = norm_q
         self.norm_k = norm_k
 
-        self.apply(self._initialize_weights)
-
-    def _initialize_weights(self, module: nn.Module):
-        if getattr(module, "_is_hf_initialized", False):
-            return
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight, gain=2 ** -2.5)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        module._is_hf_initialized = True
-
-    def forward(self, x):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
         mode = self.mode
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
 
-        q = rearrange(q, '... (h d) -> ... h d', h=self.num_heads)
+        q = rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim)
         if self.num_kv_groups > 1:
-            k, v = (repeat(x, '... (h d) -> ... (h g) d', h=self.num_kv_heads, g=self.num_kv_groups) for x in (k, v))
+            k = repeat(k, '... (h d) -> ... (h g) d', d=self.head_k_dim, g=self.num_kv_groups)
+            v = repeat(v, '... (h d) -> ... (h g) d', d=self.head_v_dim, g=self.num_kv_groups)
         else:
-            k, v = (rearrange(x, '... (h d) -> ... h d', h=self.num_kv_heads) for x in (k, v))
+            k = rearrange(k, '... (h d) -> ... h d', d=self.head_k_dim)
+            v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
 
         q = self.feature_map_q(q)
         k = self.feature_map_k(k)
@@ -148,7 +140,6 @@ class LinearAttention(nn.Module):
                 k=k,
                 v=v,
                 normalize=self.do_feature_map_norm,
-                head_first=False
             )
         elif mode == 'fused_chunk':
             o, final_state = fused_chunk_linear_attn(
@@ -167,5 +158,6 @@ class LinearAttention(nn.Module):
         else:
             raise NotImplementedError
         o = self.norm(o)
+        o = rearrange(o, '... h d -> ... (h d)')
         o = self.o_proj(o)
         return o

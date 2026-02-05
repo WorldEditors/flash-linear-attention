@@ -1,13 +1,10 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2024, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 """
 https://github.com/corl-team/rebased/blob/main/flash_linear_attention/fla/layers/rebased_fast.py
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -19,6 +16,7 @@ from fla.ops.rebased import parallel_rebased
 
 
 class ReBasedLinearAttention(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -26,14 +24,14 @@ class ReBasedLinearAttention(nn.Module):
         feature_dim: int = 16,
         num_key_value_heads: int = 16,
         num_heads: int = 16,
-        use_gamma: Optional[bool] = True,
-        use_beta: Optional[bool] = True,
-        normalize: Optional[bool] = True,
+        use_gamma: bool | None = True,
+        use_beta: bool | None = True,
+        normalize: bool | None = True,
         causal: bool = True,
         eps: float = 1e-5,
         mode: str = "parallel",
-        layer_idx: Optional[int] = None,
-        **kwargs
+        layer_idx: int | None = None,
+        **kwargs,
     ) -> ReBasedLinearAttention:
         super().__init__()
         self.hidden_size = hidden_size
@@ -41,7 +39,6 @@ class ReBasedLinearAttention(nn.Module):
         self.mode = mode
         assert self.mode in ["fused_chunk", "parallel", 'chunk']
 
-        # linear attention
         self.feature_dim = feature_dim
         self.num_key_value_heads = num_key_value_heads
         self.num_heads = num_heads
@@ -50,6 +47,9 @@ class ReBasedLinearAttention(nn.Module):
         self.use_beta = use_beta
         self.normalize = normalize
         self.causal = causal
+        self.eps = eps
+        self.mode = mode
+        self.layer_idx = layer_idx
 
         self.feature_map = RebasedFeatureMap(self.feature_dim, use_gamma, use_beta, normalize)
         self.q_proj = nn.Linear(self.hidden_size, self.feature_dim * self.num_heads, bias=False)
@@ -57,23 +57,27 @@ class ReBasedLinearAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.dropout = nn.Identity()
-        self.eps = eps
-
-        self.apply(self._initialize_weights)
-
-    def _initialize_weights(self, module: nn.Module):
-        if getattr(module, "_is_hf_initialized", False):
-            return
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight, gain=2 ** -2.5)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        module._is_hf_initialized = True
 
     def forward(self, hidden_states: torch.Tensor, **kwargs):
         mode = self.mode
-        q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
-        q, k, v = map(lambda x: rearrange(x, "... (h d) -> ... h d", h=self.num_heads), [q, k, v])
+        q = rearrange(
+            self.q_proj(hidden_states),
+            "... (h d) -> ... h d",
+            h=self.num_heads,
+            d=self.feature_dim,
+        )
+        k = rearrange(
+            self.k_proj(hidden_states),
+            "... (h d) -> ... h d",
+            h=self.num_heads,
+            d=self.feature_dim,
+        )
+        v = rearrange(
+            self.v_proj(hidden_states),
+            "... (h d) -> ... h d",
+            h=self.num_key_value_heads,
+            d=self.head_dim,
+        )
         q, k = self.feature_map(q, flatten=(mode != 'parallel')), self.feature_map(k, flatten=(mode != 'parallel'))
         if mode == "fused_chunk":
             o = fused_chunk_linear_attn(
@@ -82,7 +86,6 @@ class ReBasedLinearAttention(nn.Module):
                 v=v,
                 normalize=True,
                 scale=1,
-                head_first=False
             )
         elif mode == 'chunk':
             o = chunk_linear_attn(
@@ -91,7 +94,6 @@ class ReBasedLinearAttention(nn.Module):
                 v=v,
                 normalize=True,
                 scale=1,
-                head_first=False
             )
         elif mode == 'parallel':
             assert q.shape[-1] <= 128
@@ -102,14 +104,20 @@ class ReBasedLinearAttention(nn.Module):
                 eps=self.eps,
                 use_scale=True,
                 use_normalize=True,
-                head_first=False
             )
+        o = rearrange(o, "... h d -> ... (h d)")
         o = self.o_proj(o)
         o = self.dropout(o)
         return o
 
     # https://github.com/HazyResearch/zoology/blob/main/zoology/mixers/based.py#L119
-    def forward_reference(self, hidden_states: torch.Tensor, filters: torch.Tensor = None, *args, **kwargs):
+    def forward_reference(
+        self,
+        hidden_states: torch.Tensor,
+        filters: torch.Tensor = None,
+        *args,
+        **kwargs,
+    ):
         """
         x (torch.Tensor): tensor of shape (b, d, t)
         y (torch.Tensor): tensor of shape (b, d, t)
@@ -117,9 +125,9 @@ class ReBasedLinearAttention(nn.Module):
         b, t, _ = hidden_states.size()
         q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
 
-        q = q.view(b, t, self.num_heads, self.feature_dim).transpose(1, 2)
-        k = k.view(b, t, self.num_key_value_heads, self.feature_dim).transpose(1, 2)
-        v = v.view(b, t, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        q = q.view(b, t, -1, self.feature_dim).transpose(1, 2)
+        k = k.view(b, t, -1, self.feature_dim).transpose(1, 2)
+        v = v.view(b, t, -1, self.head_dim).transpose(1, 2)
 
         # Linear attention
         q, k = self.feature_map(q), self.feature_map(k)

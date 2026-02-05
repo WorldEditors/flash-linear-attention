@@ -1,24 +1,24 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2024, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 
+from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import RMSNorm, ShortConvolution
-from fla.modules.activations import swish
-from fla.modules.feature_map import (ReLUFeatureMap, SwishFeatureMap,
-                                     T2RFeatureMap)
+from fla.modules.feature_map import ReLUFeatureMap, SwishFeatureMap, T2RFeatureMap
 from fla.modules.layernorm import rms_norm_linear
 from fla.ops.gsa import chunk_gsa, fused_recurrent_gsa
 
 if TYPE_CHECKING:
+    from transformers.processing_utils import Unpack
+
     from fla.models.utils import Cache
 
 
@@ -31,21 +31,21 @@ class GatedSlotAttention(nn.Module):
         expand_k: float = 1.,
         expand_v: float = 1.,
         num_heads: int = 4,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         use_short_conv: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
-        num_slots: Optional[int] = None,
-        elementwise_affine: Optional[bool] = True,
-        norm_first: bool = True,
+        num_slots: int | None = None,
+        elementwise_affine: bool | None = True,
         norm_eps: float = 1e-5,
         gate_logit_normalizer: int = 8,
         feature_map: str = 'swish',
         use_output_gate: bool = False,
         use_norm: bool = True,
-        layer_idx: Optional[int] = None,
-        scale: Optional[float] = 1.,
-        **kwargs
+        layer_idx: int | None = None,
+        scale: float | None = 1.,
+        gate_bound: float = 20.0,
+        **kwargs,
     ) -> GatedSlotAttention:
         super().__init__()
 
@@ -76,7 +76,6 @@ class GatedSlotAttention(nn.Module):
         if num_slots is None:
             num_slots = self.head_k_dim
         self.num_slots = num_slots
-        self.norm_first = norm_first
 
         self.layer_idx = layer_idx
 
@@ -84,11 +83,11 @@ class GatedSlotAttention(nn.Module):
             warnings.warn(
                 f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
                 "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
+                "when creating this class.",
             )
 
-        if norm_first:
-            self.norm = RMSNorm(self.hidden_size, eps=norm_eps)
+        self.gate_bound = gate_bound
+
         self.register_module('feature_map', None)
         if feature_map == 'swish':
             self.feature_map = SwishFeatureMap()
@@ -106,33 +105,37 @@ class GatedSlotAttention(nn.Module):
 
         if use_short_conv:
             self.conv_size = conv_size
-            self.q_conv1d = ShortConvolution(self.key_dim, conv_size, activation='silu')
-            self.k_conv1d = ShortConvolution(self.key_dim_per_group, conv_size, activation='silu')
-            self.v_conv1d = ShortConvolution(self.value_dim_per_group, conv_size, activation='silu')
+            self.q_conv1d = ShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation='silu',
+            )
+            self.k_conv1d = ShortConvolution(
+                hidden_size=self.key_dim_per_group,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation='silu',
+            )
+            self.v_conv1d = ShortConvolution(
+                hidden_size=self.value_dim_per_group,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation='silu',
+            )
 
-        self.g_norm = RMSNorm(self.hidden_size, elementwise_affine, eps=norm_eps)
+        self.g_norm = RMSNorm(self.hidden_size, elementwise_affine, eps=norm_eps, dtype=torch.float32)
         self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
-
-        self.apply(self._initialize_weights)
-
-    def _initialize_weights(self, module: nn.Module):
-        if getattr(module, "_is_hf_initialized", False):
-            return
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight, gain=2 ** -2.5)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        module._is_hf_initialized = True
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-        **kwargs
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
+        **kwargs: Unpack[dict],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
@@ -140,54 +143,63 @@ class GatedSlotAttention(nn.Module):
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
 
-        # launching the triton kernel for just one token will actually be slower
-        mode = 'fused_recurrent' if hidden_states.shape[1] == 1 else self.mode
-
-        if self.norm_first:
-            hidden_states = self.norm(hidden_states)
+        batch_size, q_len, _ = hidden_states.shape
+        mode = 'fused_recurrent' if hidden_states.shape[1] <= 64 else self.mode
 
         last_state = None
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             last_state = past_key_values[self.layer_idx]
 
+        cu_seqlens = kwargs.get('cu_seqlens')
+        if attention_mask is not None:
+            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
+
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             if last_state is not None:
                 conv_state_q, conv_state_k, conv_state_v = last_state['conv_state']
-            conv_mask = attention_mask[:, -hidden_states.shape[1]:] if attention_mask is not None else None
-            q, conv_state_q = self.q_conv1d(x=self.q_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_q,
-                                            output_final_state=use_cache)
-            k, conv_state_k = self.k_conv1d(x=self.k_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_k,
-                                            output_final_state=use_cache)
-            v, conv_state_v = self.v_conv1d(x=self.v_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_v,
-                                            output_final_state=use_cache)
+            q, conv_state_q = self.q_conv1d(
+                x=self.q_proj(hidden_states),
+                cache=conv_state_q,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+            k, conv_state_k = self.k_conv1d(
+                x=self.k_proj(hidden_states),
+                cache=conv_state_k,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+            v, conv_state_v = self.v_conv1d(
+                x=self.v_proj(hidden_states),
+                cache=conv_state_v,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
         else:
             q = self.q_proj(hidden_states)
             k = self.k_proj(hidden_states)
             v = self.v_proj(hidden_states)
         f = self.f_proj(hidden_states)
 
-        q = rearrange(q, 'b t (h d) -> b t h d', h=self.num_heads)
-        k = rearrange(k, 'b t (h d) -> b t h d', h=self.num_kv_heads)
-        v = rearrange(v, 'b t (h d) -> b t h d', h=self.num_kv_heads)
-        f = rearrange(f, 'b t (h m) -> b t h m', h=self.num_kv_heads)
+        q = rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim)
+        k = rearrange(k, '... (h d) -> ... h d', d=self.head_k_dim)
+        v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
+        f = rearrange(f, '... (h m) -> ... h m', m=self.num_slots)
 
         if self.feature_map is not None:
             q, k = map(lambda x: self.feature_map(x), (q, k))
-        v = swish(v)
+        v = F.silu(v)
+
+        # Bound f for safety
+        f = self.gate_bound * F.softsign(f / self.gate_bound)
 
         f = F.logsigmoid(f) / self.gate_logit_normalizer
         s = (1 - f.exp()).to(f.dtype)
-        # dealing with left-padding
-        if attention_mask is not None:
-            s = s.mul_(attention_mask[:, -s.shape[1]:, None, None])
-            v = v.mul_(attention_mask[:, -v.shape[1]:, None, None])
+
+        if self.num_kv_groups > 1:
+            k, v, f, s = map(lambda x: repeat(x, '... h d -> ... (h g) d', g=self.num_kv_groups), (k, v, f, s))
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'fused_recurrent':
@@ -200,7 +212,7 @@ class GatedSlotAttention(nn.Module):
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
                 scale=self.scale,
-                head_first=False
+                cu_seqlens=cu_seqlens,
             )
         elif mode == 'chunk':
             o, recurrent_state = chunk_gsa(
@@ -212,7 +224,7 @@ class GatedSlotAttention(nn.Module):
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
                 scale=self.scale,
-                head_first=False
+                cu_seqlens=cu_seqlens,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
@@ -222,12 +234,12 @@ class GatedSlotAttention(nn.Module):
                 recurrent_state=recurrent_state,
                 conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
                 layer_idx=self.layer_idx,
-                offset=q.shape[2]
+                offset=q_len,
             )
 
-        o = rearrange(o, 'b t h d -> b t (h d)')
-        o = rms_norm_linear(swish(o), self.g_norm.weight, self.g_norm.bias, self.o_proj.weight, self.o_proj.bias)
-        return o, None, past_key_values
+        o = rearrange(o, '... h d -> ... (h d)')
+        o = rms_norm_linear(F.silu(o), self.g_norm.weight, self.g_norm.bias, self.o_proj.weight, self.o_proj.bias)
+        if attention_mask is not None:
+            o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
-    def state_size(self, *args, **kwargs) -> int:
-        return 2 * self.num_slots * self.hidden_size
+        return o, None, past_key_values

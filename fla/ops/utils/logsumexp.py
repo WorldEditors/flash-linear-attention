@@ -1,27 +1,25 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2024, Songlin Yang, Yu Zhang
 
-from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from fla.ops.utils.op import exp, log
+from fla.utils import autotune_cache_kwargs
 
+
+@triton.heuristics({
+    'HAS_SCALE': lambda args: args['scale'] is not None,
+})
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4, 8, 16, 32]
     ],
-    key=['D']
+    key=['D'],
+    **autotune_cache_kwargs,
 )
-@triton.heuristics({
-    'HAS_SCALE': lambda args: args['scale'] is not None
-})
 @triton.jit
 def logsumexp_fwd_kernel(
     x,
@@ -29,9 +27,9 @@ def logsumexp_fwd_kernel(
     scale,
     D: tl.constexpr,
     B: tl.constexpr,
-    HAS_SCALE: tl.constexpr
+    HAS_SCALE: tl.constexpr,
 ):
-    i_n, i_d = tl.program_id(0), tl.program_id(1)
+    i_n, i_d = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     o_d = i_d * B + tl.arange(0, B)
     m_d = o_d < D
 
@@ -39,14 +37,14 @@ def logsumexp_fwd_kernel(
     if HAS_SCALE:
         b_x = b_x * scale
     b_m = tl.max(b_x, 0)
-    b_z = tl.log(tl.sum(tl.exp(b_x - b_m), 0)) + b_m
+    b_z = log(tl.sum(exp(b_x - b_m), 0)) + b_m
     tl.store(z + i_n * tl.cdiv(D, B) + i_d, b_z)
 
 
 def logsumexp_fwd(
     x,
-    scale: Optional[float] = None,
-    dtype: Optional[torch.dtype] = None
+    scale: float | None = None,
+    dtype: torch.dtype | None = None,
 ):
     r"""
     Compute the logsumexp of the input tensor over the last dimension.
@@ -74,7 +72,7 @@ def logsumexp_fwd(
         z=z,
         scale=scale,
         D=D,
-        B=B
+        B=B,
     )
     z = z.logsumexp(-1).view(*shape[:-1])
     if dtype is not None and dtype != torch.float:

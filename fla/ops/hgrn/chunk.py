@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2024, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 # this function implements the chunkwise form of HGRN, inspired by
 # [Volodymyr Kyrylov in his blog post](https://proger.github.io/posts/scan/chunk.html)
@@ -18,13 +17,13 @@
 # 6   8192.0  0.647872   3.755040   1.740496      11.117184
 # 7  16384.0  1.272064   7.520576   3.446608      22.362528
 
-from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from fla.utils import contiguous
+from fla.ops.utils.op import exp
+from fla.utils import autotune_cache_kwargs, input_guard
 
 
 @triton.autotune(
@@ -42,20 +41,21 @@ from fla.utils import contiguous
         triton.Config({'BD': 128}, num_warps=4),
         triton.Config({'BD': 128}, num_warps=8),
     ],
-    key=['D']
+    key=['D'],
+    **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def chunk_hgrn_fwd_kernel_h(
     x,
     g,
     gc,
     o,
     h0,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr
+    USE_INITIAL_STATE: tl.constexpr,
 ):
     i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     o_d = i_d * BD + tl.arange(0, BD)
@@ -75,7 +75,7 @@ def chunk_hgrn_fwd_kernel_h(
         mask_t = mask & ((i_t * BT + i) < T)
         b_x = tl.load(p_x, mask=mask_t, other=0).to(tl.float32)
         b_g = tl.load(p_g, mask=mask_t, other=0).to(tl.float32)
-        b_h = tl.exp(b_g) * b_h + b_x
+        b_h = exp(b_g) * b_h + b_x
         b_gc = b_gc + b_g
         tl.store(p_gc, b_gc.to(p_o.dtype.element_ty), mask=mask_t)
         tl.store(p_o, b_h.to(p_o.dtype.element_ty), mask=mask_t)
@@ -86,17 +86,17 @@ def chunk_hgrn_fwd_kernel_h(
         p_o += D
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def chunk_hgrn_fwd_kernel_o(
     gc,
     o,
     s_b,
     s_t,
     s_d,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
-    BD: tl.constexpr
+    BD: tl.constexpr,
 ):
     i_d, i_b = tl.program_id(0), tl.program_id(1)
     o_d = i_d * BD + tl.arange(0, BD)
@@ -111,37 +111,29 @@ def chunk_hgrn_fwd_kernel_o(
         # [BT, BD]
         b_gc = tl.load(p_gc, boundary_check=(0, 1)).to(tl.float32)
         b_o = tl.load(p_o, boundary_check=(0, 1)).to(tl.float32)
-        b_o = b_o + tl.exp(b_gc) * b_h0[None, :]
+        b_o = b_o + exp(b_gc) * b_h0[None, :]
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.autotune(
     configs=[
-        triton.Config({'BD': 32}, num_warps=1),
-        triton.Config({'BD': 32}, num_warps=2),
-        triton.Config({'BD': 32}, num_warps=4),
-        triton.Config({'BD': 32}, num_warps=8),
-        triton.Config({'BD': 64}, num_warps=1),
-        triton.Config({'BD': 64}, num_warps=2),
-        triton.Config({'BD': 64}, num_warps=4),
-        triton.Config({'BD': 64}, num_warps=8),
-        triton.Config({'BD': 128}, num_warps=1),
-        triton.Config({'BD': 128}, num_warps=2),
-        triton.Config({'BD': 128}, num_warps=4),
-        triton.Config({'BD': 128}, num_warps=8),
+        triton.Config({'BD': BD}, num_warps=num_warps)
+        for BD in [32, 64, 128]
+        for num_warps in [1, 2, 4, 8]
     ],
-    key=['D']
+    key=['D'],
+    **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def chunk_hgrn_bwd_kernel_h(
     g,
     gc,
     dx,
     do,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
-    BD: tl.constexpr
+    BD: tl.constexpr,
 ):
     i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     o_d = i_d * BD + tl.arange(0, BD)
@@ -168,7 +160,7 @@ def chunk_hgrn_bwd_kernel_h(
         b_gc = b_gc + b_g
         b_dh = b_dh + b_do
         b_dx = b_dh
-        b_dh = b_dh * tl.exp(b_g)
+        b_dh = b_dh * exp(b_g)
 
         tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), mask=mask)
 
@@ -178,7 +170,7 @@ def chunk_hgrn_bwd_kernel_h(
         p_do -= D
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def chunk_hgrn_bwd_kernel_o(
     g,
     gc,
@@ -188,10 +180,10 @@ def chunk_hgrn_bwd_kernel_o(
     s_b,
     s_t,
     s_d,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
-    BD: tl.constexpr
+    BD: tl.constexpr,
 ):
     i_d, i_b = tl.program_id(0), tl.program_id(1)
     o_d = i_d * BD + tl.arange(0, BD)
@@ -213,8 +205,8 @@ def chunk_hgrn_bwd_kernel_o(
         b_o = tl.load(p_o, boundary_check=(0, 1)).to(tl.float32)
         b_dx = tl.load(p_dx, boundary_check=(0, 1)).to(tl.float32)
 
-        b_dx = b_dx + tl.exp(b_gc) * b_ht[None, :]
-        b_dg = b_o * b_dx * tl.exp(b_g)
+        b_dx = b_dx + exp(b_gc) * b_ht[None, :]
+        b_dg = b_o * b_dx * exp(b_g)
         tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0, 1))
 
@@ -222,7 +214,7 @@ def chunk_hgrn_bwd_kernel_o(
 class ChunkHGRNFunction(torch.autograd.Function):
 
     @staticmethod
-    @contiguous
+    @input_guard
     def forward(ctx, x, g, initial_state=None, output_final_state=False):
         B, T, D = x.shape
         BT, BD = 128, min(64, triton.next_power_of_2(D))
@@ -234,14 +226,14 @@ class ChunkHGRNFunction(torch.autograd.Function):
         chunk_hgrn_fwd_kernel_h[grid](
             x, g, gc, o, initial_state,
             T=T, D=D, BT=BT,
-            USE_INITIAL_STATE=initial_state is not None
+            USE_INITIAL_STATE=initial_state is not None,
         )
         def grid(meta): return (triton.cdiv(D, meta['BD']), B)
         chunk_hgrn_fwd_kernel_o[grid](
             gc, o,
             o.stride(-3), o.stride(-2), o.stride(-1),
             T=T, D=D, BT=BT, BD=BD,
-            num_warps=num_warps
+            num_warps=num_warps,
         )
         final_state = None
         if output_final_state:
@@ -251,7 +243,7 @@ class ChunkHGRNFunction(torch.autograd.Function):
         return o, final_state
 
     @staticmethod
-    @contiguous
+    @input_guard
     def backward(ctx, do, dht=None):
         g, o, initial_state = ctx.saved_tensors
         B, T, D = do.shape
@@ -263,7 +255,7 @@ class ChunkHGRNFunction(torch.autograd.Function):
         def grid(meta): return (triton.cdiv(D, meta['BD']), triton.cdiv(T, meta['BT']), B)
         chunk_hgrn_bwd_kernel_h[grid](
             g, gc, dx, do,
-            T=T, D=D, BT=BT
+            T=T, D=D, BT=BT,
         )
 
         dg = torch.empty_like(g, dtype=torch.float)
@@ -272,7 +264,7 @@ class ChunkHGRNFunction(torch.autograd.Function):
             g, gc, o, dx, dg,
             o.stride(-3), o.stride(-2), o.stride(-1),
             T=T, D=D, BT=BT, BD=BD,
-            num_warps=num_warps
+            num_warps=num_warps,
         )
         if initial_state is not None:
             dg[:, 0] = (initial_state * dx[:, 0] * g[:, 0].float().exp()).to(dg.dtype)
@@ -280,10 +272,11 @@ class ChunkHGRNFunction(torch.autograd.Function):
         return dx.to(o.dtype), dg, None, None
 
 
+@torch.compiler.disable
 def chunk_hgrn(
     x: torch.Tensor,
     g: torch.Tensor,
     initial_state: torch.Tensor = None,
-    output_final_state: bool = False
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    output_final_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     return ChunkHGRNFunction.apply(x, g, initial_state, output_final_state)

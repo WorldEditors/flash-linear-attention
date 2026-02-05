@@ -1,28 +1,36 @@
-# -*- coding: utf-8 -*-
 
 import pytest
 import torch
 
 from fla.ops.based import fused_chunk_based, parallel_based
 from fla.ops.based.naive import naive_parallel_based
+from fla.utils import device
 
 
-@pytest.mark.parametrize("B", [4])
-@pytest.mark.parametrize("H", [4])
-@pytest.mark.parametrize("T", [300, 512])
-@pytest.mark.parametrize("D", [8, 15])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'D', 'dtype'),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-D{}-{}".format(*test))
+        for test in [
+            (1, 63, 1, 60, torch.float16),
+            (3, 111, 2, 64, torch.float16),
+            (3, 1024, 4, 100, torch.float16),
+            (3, 1024, 8, 128, torch.float16),
+            (4, 2048, 8, 256, torch.float16),
+        ]
+    ],
+)
 def test_based(
     B: int,
-    H: int,
     T: int,
+    H: int,
     D: int,
-    dtype: torch.dtype
+    dtype: torch.dtype,
 ):
     torch.manual_seed(42)
-    q = torch.randn((B, H, T, 16), dtype=dtype, device='cuda').requires_grad_()
-    k = torch.randn((B, H, T, 16), dtype=dtype, device='cuda').requires_grad_()
-    v = torch.randn((B, H, T, D), dtype=dtype, device='cuda').requires_grad_()
+    q = torch.randn((B, H, T, 16), dtype=dtype, device=device).requires_grad_()
+    k = torch.randn((B, H, T, 16), dtype=dtype, device=device).requires_grad_()
+    v = torch.randn((B, H, T, D), dtype=dtype, device=device).requires_grad_()
     do = torch.randn_like(v)
     ref = naive_parallel_based(q, k, v, use_norm=True)
     ref.backward(do)

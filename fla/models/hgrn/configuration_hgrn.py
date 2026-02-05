@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
 
-from typing import Dict, Optional
+import warnings
 
 from transformers.configuration_utils import PretrainedConfig
 
@@ -12,29 +11,33 @@ class HGRNConfig(PretrainedConfig):
 
     def __init__(
         self,
-        attn_mode: str = "chunk",
+        attn_mode: str = "fused_recurrent",
         hidden_size: int = 2048,
         num_hidden_layers: int = 24,
-        expand_ratio: Optional[int] = 1,
+        expand_ratio: int | None = 1,
         use_short_conv: bool = False,
         conv_size: int = 4,
         use_lower_bound: bool = True,
         max_position_embeddings: int = 2048,
-        hidden_ratio: Optional[int] = 4,
-        intermediate_size: Optional[int] = None,
+        hidden_ratio: int | None = 4,
+        intermediate_size: int | None = None,
         hidden_act: str = "swish",
-        elementwise_affine: Optional[bool] = True,
+        elementwise_affine: bool | None = True,
         norm_eps: float = 1e-6,
-        attn: Optional[Dict] = None,
+        attn: dict | None = None,
         use_cache: bool = True,
-        pad_token_id: int = None,
+        pad_token_id: int | None = None,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         tie_word_embeddings: bool = False,
         initializer_range: float = 0.02,
+        fuse_norm: bool = True,
+        fuse_swiglu: bool = True,
         fuse_cross_entropy: bool = True,
+        fuse_linear_cross_entropy: bool = False,
+        use_l2warp: bool = False,
         vocab_size: int = 32000,
-        **kwargs
+        **kwargs,
     ):
         self.attn_mode = attn_mode
         self.hidden_size = hidden_size
@@ -52,18 +55,36 @@ class HGRNConfig(PretrainedConfig):
         self.hidden_act = hidden_act
         self.use_cache = use_cache
         self.initializer_range = initializer_range
+
+        self.fuse_norm = fuse_norm
+        self.fuse_swiglu = fuse_swiglu
         self.fuse_cross_entropy = fuse_cross_entropy
+        self.fuse_linear_cross_entropy = fuse_linear_cross_entropy
+        self.use_l2warp = use_l2warp
         self.vocab_size = vocab_size
 
+        if fuse_cross_entropy and fuse_linear_cross_entropy:
+            raise ValueError(
+                "`fuse_cross_entropy` and `fuse_linear_cross_entropy` cannot be True at the same time.",
+            )
+        if fuse_linear_cross_entropy:
+            warnings.warn(
+                "`fuse_linear_cross_entropy` is enabled, which can improves memory efficiency "
+                "at the potential cost of reduced precision. "
+                "If you observe issues like loss divergence, consider disabling this setting.",
+            )
+
         if attn is not None:
-            if not isinstance(attn, Dict):
+            if not isinstance(attn, dict):
                 raise ValueError("attn must be a dictionary")
             if 'layers' not in attn:
                 raise ValueError("Layer indices must be provided to initialize hybrid attention layers")
             if 'num_heads' not in attn:
                 raise ValueError("Number of heads must be provided to initialize hybrid attention layers")
             attn['num_kv_heads'] = attn.get('num_kv_heads', attn['num_heads'])
+            attn['qkv_bias'] = attn.get('qkv_bias', False)
             attn['window_size'] = attn.get('window_size', None)
+            attn['rope_theta'] = attn.get('rope_theta', 10000.)
 
         super().__init__(
             pad_token_id=pad_token_id,

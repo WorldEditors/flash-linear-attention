@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MAMBA configuration"""
 
 import math
+import warnings
 
 from transformers.configuration_utils import PretrainedConfig
 
@@ -39,7 +38,7 @@ class MambaConfig(PretrainedConfig):
             Shape of the state space latents. Default: 16.
         num_hidden_layers (`int`, *optional*):
             Number of hidden layers in the model. Default: 48.
-        layer_norm_epsilon (`float`, *optional*):
+        norm_eps (`float`, *optional*):
             The epsilon to use in the layer normalization layers. Default: 1e-5.
         pad_token_id (`int`, *optional*):
             Padding token id. Default: 0.
@@ -58,7 +57,7 @@ class MambaConfig(PretrainedConfig):
         hidden_act (`str`, *optional*):
             The non-linear activation function (function or string) in the decoder. Default: `"silu"`.
         initializer_range (`float`, *optional*):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices. Default: 0.1.
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices. Default: 0.02.
         residual_in_fp32 (`bool`, *optional*):
             Whether or not residuals should be in `float32`.
             If set to `False` residuals will keep the same `dtype` as the rest of the model. Default: `True`.
@@ -106,7 +105,7 @@ class MambaConfig(PretrainedConfig):
         hidden_size: int = 2048,
         state_size: int = 16,
         num_hidden_layers: int = 48,
-        layer_norm_epsilon=1e-5,
+        norm_eps=1e-5,
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -115,7 +114,7 @@ class MambaConfig(PretrainedConfig):
         use_bias: bool = False,
         use_conv_bias: bool = True,
         hidden_act: str = "silu",
-        initializer_range: str = 0.1,
+        initializer_range: float = 0.02,
         residual_in_fp32: bool = False,
         time_step_rank: str = "auto",
         time_step_scale: float = 1.0,
@@ -127,6 +126,8 @@ class MambaConfig(PretrainedConfig):
         use_cache: bool = True,
         fuse_norm: bool = True,
         fuse_cross_entropy: bool = True,
+        fuse_linear_cross_entropy: bool = False,
+        use_l2warp: bool = False,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
@@ -134,7 +135,7 @@ class MambaConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.state_size = state_size
         self.num_hidden_layers = num_hidden_layers
-        self.layer_norm_epsilon = layer_norm_epsilon
+        self.norm_eps = norm_eps
         self.conv_kernel = conv_kernel
         self.expand = expand
         self.intermediate_size = int(expand * self.hidden_size)
@@ -154,13 +155,26 @@ class MambaConfig(PretrainedConfig):
         self.rescale_prenorm_residual = rescale_prenorm_residual
         self.residual_in_fp32 = residual_in_fp32
         self.use_cache = use_cache
-        self.fuse_cross_entropy = fuse_cross_entropy
         self.fuse_norm = fuse_norm
+        self.fuse_cross_entropy = fuse_cross_entropy
+        self.fuse_linear_cross_entropy = fuse_linear_cross_entropy
+        self.use_l2warp = use_l2warp
+
+        if fuse_cross_entropy and fuse_linear_cross_entropy:
+            raise ValueError(
+                "`fuse_cross_entropy` and `fuse_linear_cross_entropy` cannot be True at the same time.",
+            )
+        if fuse_linear_cross_entropy:
+            warnings.warn(
+                "`fuse_linear_cross_entropy` is enabled, which can improves memory efficiency "
+                "at the potential cost of reduced precision. "
+                "If you observe issues like loss divergence, consider disabling this setting.",
+            )
 
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            **kwargs
+            **kwargs,
         )

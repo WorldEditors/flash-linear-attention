@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
-
-from typing import Tuple
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import torch
 import torch.nn as nn
@@ -8,13 +6,15 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from fla.utils import contiguous
+from fla.ops.utils.op import exp, log
+from fla.utils import IS_AMD, input_guard
 
 # The hard limit of TRITON_MAX_TENSOR_NUMEL is 1048576
 # https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/language/core.py#L19
 # However, setting limit as 65536 as in LayerNorm tutorial is faster because of less register spilling
 # The optimal maximum block size depends on your hardware, your kernel, and your dtype
 MAX_FUSED_SIZE = 65536 // 2
+STATIC_WARPS = 32 if not IS_AMD else 16
 
 
 @triton.jit
@@ -27,7 +27,7 @@ def kl_div_kernel(
     reduction: tl.constexpr,
     N: tl.constexpr,
     V: tl.constexpr,
-    BV: tl.constexpr
+    BV: tl.constexpr,
 ):
     # https://github.com/triton-lang/triton/issues/1058
     # If N*V is too large, i_n * stride will overflow out of int32, so we convert to int64
@@ -37,7 +37,8 @@ def kl_div_kernel(
     target_logits += i_n * s_logits
 
     # m is the max value. use the notation from the paper
-    sm, tm = float('-inf'), float('-inf')
+    sm = float('-inf')
+    tm = float('-inf')
     # d is the sum. use the notation from the paper
     sd, td = 0.0, 0.0
 
@@ -48,13 +49,13 @@ def kl_div_kernel(
         b_sl = tl.load(logits + o_x, mask=o_x < V, other=float('-inf'))
         b_sm = tl.max(b_sl)
         m_new = tl.maximum(sm, b_sm)
-        sd = sd * tl.exp(sm - m_new) + tl.sum(tl.exp(b_sl - m_new))
+        sd = sd * exp(sm - m_new) + tl.sum(exp(b_sl - m_new))
         sm = m_new
         # for teacher
         b_tl = tl.load(target_logits + o_x, mask=o_x < V, other=float('-inf'))
         b_tm = tl.max(b_tl)
         m_new = tl.maximum(tm, b_tm)
-        td = td * tl.exp(tm - m_new) + tl.sum(tl.exp(b_tl - m_new))
+        td = td * exp(tm - m_new) + tl.sum(exp(b_tl - m_new))
         tm = m_new
 
     b_loss = 0.
@@ -63,10 +64,10 @@ def kl_div_kernel(
         o_x = iv * BV + tl.arange(0, BV)
         b_sl = tl.load(logits + o_x, mask=o_x < V, other=float('-inf'))
         b_tl = tl.load(target_logits + o_x, mask=o_x < V, other=float('-inf'))
-        b_sp_log = b_sl - sm - tl.log(sd)
-        b_tp_log = b_tl - tm - tl.log(td)
-        b_sp = tl.exp(b_sp_log)
-        b_tp = tl.exp(b_tp_log)
+        b_sp_log = b_sl - sm - log(sd)
+        b_tp_log = b_tl - tm - log(td)
+        b_sp = exp(b_sp_log)
+        b_tp = exp(b_tp_log)
         b_kl = tl.where(o_x < V, b_tp * (b_tp_log - b_sp_log), 0)
         b_dl = -b_tp + b_sp
         b_loss += tl.sum(b_kl)
@@ -86,7 +87,7 @@ def elementwise_mul_kernel(
     x,
     g,
     N: tl.constexpr,
-    B: tl.constexpr
+    B: tl.constexpr,
 ):
     """
     This function multiplies each element of the tensor pointed by x with the value pointed by g.
@@ -118,7 +119,7 @@ def fused_kl_div_forward(
     target_x: torch.Tensor,
     weight: torch.Tensor,
     target_weight: torch.Tensor,
-    reduction: str = 'batchmean'
+    reduction: str = 'batchmean',
 ):
     device = x.device
 
@@ -164,7 +165,7 @@ def fused_kl_div_forward(
             N=N,
             V=V,
             BV=BV,
-            num_warps=32
+            num_warps=STATIC_WARPS,
         )
 
         # gradient of logits is computed in-place by the above triton kernel and is of shape: C x V
@@ -186,7 +187,7 @@ def fused_kl_div_forward(
 def fused_kl_div_backward(
     do: torch.Tensor,
     dx: torch.Tensor,
-    dw: torch.Tensor
+    dw: torch.Tensor,
 ):
     # If cross entropy is the last layer, do is 1.0. Skip the mul to save time
     if torch.ne(do, torch.tensor(1.0, device=do.device)):
@@ -200,7 +201,7 @@ def fused_kl_div_backward(
             g=do,
             N=N*H,
             B=B,
-            num_warps=32,
+            num_warps=STATIC_WARPS,
         )
 
         # handle dw
@@ -211,7 +212,7 @@ def fused_kl_div_backward(
                 g=do,
                 N=V*H,
                 B=B,
-                num_warps=32,
+                num_warps=STATIC_WARPS,
             )
 
     return dx, dw
@@ -220,27 +221,27 @@ def fused_kl_div_backward(
 class FusedKLDivLossFunction(torch.autograd.Function):
 
     @staticmethod
-    @contiguous
+    @input_guard
     def forward(
         ctx,
         x: torch.Tensor,
         target_x: torch.Tensor,
         weight: torch.Tensor,
         target_weight: torch.Tensor,
-        reduction: str
+        reduction: str,
     ):
         loss, dx, dw = fused_kl_div_forward(
             x=x,
             target_x=target_x,
             weight=weight,
             target_weight=target_weight,
-            reduction=reduction
+            reduction=reduction,
         )
         ctx.save_for_backward(dx, dw)
         return loss
 
     @staticmethod
-    @contiguous
+    @input_guard
     def backward(ctx, do):
         dx, dw = ctx.saved_tensors
         dx, dw = fused_kl_div_backward(do, dx, dw)
@@ -252,8 +253,8 @@ def fused_kl_div_loss(
     target_x: torch.Tensor,
     weight: torch.Tensor,
     target_weight: torch.Tensor,
-    reduction: str = 'batchmean'
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    reduction: str = 'batchmean',
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args:
         x (torch.Tensor): [batch_size * seq_len, hidden_size]
@@ -272,7 +273,7 @@ def fused_kl_div_loss(
         target_x,
         weight,
         target_weight,
-        reduction
+        reduction,
     )
 
 
@@ -280,7 +281,7 @@ class FusedKLDivLoss(nn.Module):
 
     def __init__(
         self,
-        reduction: str = 'batchmean'
+        reduction: str = 'batchmean',
     ):
         """
         Args:
@@ -298,7 +299,7 @@ class FusedKLDivLoss(nn.Module):
         x: torch.Tensor,
         target_x: torch.Tensor,
         weight: torch.Tensor,
-        target_weight: torch.Tensor
+        target_weight: torch.Tensor,
     ):
         """
         Args:
@@ -316,6 +317,6 @@ class FusedKLDivLoss(nn.Module):
             target_x=target_x,
             weight=weight,
             target_weight=target_weight,
-            reduction=self.reduction
+            reduction=self.reduction,
         )
         return loss

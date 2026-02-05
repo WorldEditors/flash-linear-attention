@@ -8,10 +8,9 @@ https://github.com/sustcsonglin/flash-linear-attention/pull/49
 
 import torch
 import triton
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 from fla.ops.simple_gla import chunk_simple_gla
-
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 
 @triton.testing.perf_report(
@@ -32,11 +31,11 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
         # name for the plot. Used also as a file name for saving the plot.
         plot_name="Performance",
         args={},
-    )
+    ),
 )
 def benchmark(T, provider):
     # TODO: also add bwd pass benchmark
-    device = 'cuda'
+    from fla.utils import device
     dtype = torch.bfloat16
     B, H, D = 16, 8, 128
     # TODO: test more shapes
@@ -65,8 +64,8 @@ def benchmark(T, provider):
 
         results = triton.testing.do_bench(
             lambda: chunk_simple_gla(
-                q, k, v, g, scale=1.0, output_final_state=final_state
-            ), quantiles=quantiles
+                q, k, v, g, scale=1.0, output_final_state=final_state,
+            ), quantiles=quantiles,
         )
 
     elif provider == 'mamba2_ssd':
@@ -76,11 +75,12 @@ def benchmark(T, provider):
         results = triton.testing.do_bench(
             lambda:  mamba_chunk_scan_combined(
                 X_mamba, dt_mamba, A_mamba, B_mamba, C_mamba,
-                chunk_size=64, D=None, return_final_states=final_state
+                chunk_size=64, D=None, return_final_states=final_state,
             ),
-            quantiles=quantiles
+            quantiles=quantiles,
         )
     return results
+
 
 if __name__ == '__main__':
     benchmark.run(print_data=True, save_path='.')

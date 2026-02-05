@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 # scripts for converting pretrained hf model weights to fla style
 # calling the code to make conversions for RWKV/rwkv-6-world-7b would achieve the following results:
@@ -28,6 +27,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import fla  # noqa
+from fla.utils import device
 
 
 def sizeof_fmt(num, suffix='B'):
@@ -41,15 +41,15 @@ def sizeof_fmt(num, suffix='B'):
 def convert(
     rwkv6: str,
     config: str,
-    output: str
+    output: str,
 ):
     torch.manual_seed(1)
     AutoTokenizer.from_pretrained(rwkv6, trust_remote_code=True).save_pretrained(output)
-    rwkv6 = AutoModelForCausalLM.from_pretrained(rwkv6, trust_remote_code=True).cuda()
+    rwkv6 = AutoModelForCausalLM.from_pretrained(rwkv6, trust_remote_code=True).to(device)
     print(f"Loading rwkv6 ...\n{rwkv6}")
 
     config = AutoConfig.from_pretrained(config)
-    model = AutoModelForCausalLM.from_config(config).cuda()
+    model = AutoModelForCausalLM.from_config(config).to(device)
     num_parameters = model.num_parameters()
     print(f"Initializing the model from the config:\n{config}\n{model}")
     print(f"Number of parameters in total: {num_parameters} ({sizeof_fmt(num_parameters)})")

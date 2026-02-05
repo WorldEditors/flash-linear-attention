@@ -1,8 +1,5 @@
-# -*- coding: utf-8 -*-
-
 import argparse
 import time
-from typing import Optional, Tuple
 
 import torch
 from accelerate import Accelerator
@@ -26,22 +23,64 @@ def sizeof_fmt(num, suffix='B'):
     return f'{num:.2f}Yi{suffix}'
 
 
+def prepare_inputs(
+    batch_size: int,
+    seq_len: int,
+    context_len: int,
+    varlen: bool,
+    vocab_size: int,
+    device: torch.device,
+):
+    if varlen:
+        tokens = torch.randint(high=vocab_size, size=(1, batch_size * seq_len), device=device)
+        cu_seqlens = torch.cat([
+            torch.tensor([0]),
+            torch.randperm(batch_size * seq_len - 16)[:torch.randint(8, 64, size=(1,))] + 16,
+            torch.tensor([batch_size * seq_len]),
+        ], 0).sort()[0].to(dtype=torch.int32, device=device)
+        if context_len is not None:
+            cu_seqlens = torch.cat(
+                [torch.arange(i, j, context_len) for i, j in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())] +
+                [torch.tensor([len(tokens[0])])],
+            ).to(dtype=torch.int32, device=device)
+    else:
+        tokens = torch.randint(high=vocab_size, size=(batch_size, seq_len), device=device)
+        cu_seqlens = None
+    return tokens, cu_seqlens
+
+
 def profile(
     name: str,
     batch_size: int = 8,
     seq_len: int = 2048,
+    context_len: int = 2048,
+    varlen: bool = False,
+    num_heads: int | None = None,
+    head_dim: int | None = None,
+    num_hidden_layers: int | None = None,
     warmup_steps: int = 16,
     steps: int = 32,
     total_steps: int = 1024,
     lr: float = 3e-4,
-    betas: Tuple[float] = (0.9, 0.95),
+    betas: tuple[float] = (0.9, 0.95),
     weight_decay: float = 0.1,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    mixed_precision: str = 'bf16'
+    dtype: torch.dtype | None = torch.bfloat16,
+    mixed_precision: str = 'bf16',
+    compile: bool = False,
 ):
     device = torch.device('cuda')
     config = configs[name] if name in configs else AutoConfig.from_pretrained(name)
+    if num_heads is not None:
+        config.num_heads = num_heads
+    if head_dim is not None:
+        config.head_dim = head_dim
+        config.hidden_size = config.num_heads * config.head_dim
+    if num_hidden_layers is not None:
+        config.num_hidden_layers = num_hidden_layers
     model = AutoModelForCausalLM.from_config(config).cuda().to(dtype)
+    if compile:
+        print("Compiling the model")
+        model = torch.compile(model)
     num_parameters = model.num_parameters()
     print(f"Initializing {name} model from the config:\n{config}\n{model}")
     print(f"Number of parameters in total: {num_parameters} ({sizeof_fmt(num_parameters)})")
@@ -53,7 +92,7 @@ def profile(
         lr=lr,
         betas=betas,
         weight_decay=weight_decay,
-        fused=True
+        fused=True,
     )
     scheduler = get_cosine_schedule_with_warmup(optimizer, 0, total_steps)
 
@@ -63,8 +102,15 @@ def profile(
     torch.cuda.synchronize(device)
     for _ in bar:
         # forward pass
-        tokens = torch.randint(high=config.vocab_size, size=(batch_size, seq_len)).cuda()
-        outputs = model(tokens, labels=tokens)
+        tokens, cu_seqlens = prepare_inputs(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            context_len=context_len,
+            varlen=varlen,
+            vocab_size=config.vocab_size,
+            device=device,
+        )
+        outputs = model(tokens, labels=tokens, cu_seqlens=cu_seqlens)
         # backward pass
         accelerator.backward(outputs.loss)
         optimizer.step()
@@ -77,8 +123,15 @@ def profile(
     torch.cuda.synchronize(device)
     for _ in bar:
         # forward pass
-        tokens = torch.randint(high=config.vocab_size, size=(batch_size, seq_len), device=device)
-        outputs = model(tokens, labels=tokens)
+        tokens, cu_seqlens = prepare_inputs(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            context_len=context_len,
+            varlen=varlen,
+            vocab_size=config.vocab_size,
+            device=device,
+        )
+        outputs = model(tokens, labels=tokens, cu_seqlens=cu_seqlens)
         # backward pass
         accelerator.backward(outputs.loss)
         optimizer.step()
@@ -95,7 +148,25 @@ if __name__ == "__main__":
     parser.add_argument("--name", default='retnet')
     parser.add_argument("--batch_size", default=8, type=int)
     parser.add_argument("--seq_len", default=2048, type=int)
-    parser.add_argument("--warmup_steps", default=16, type=int)
-    parser.add_argument("--steps", default=32, type=int)
+    parser.add_argument("--context_len", default=None, type=int)
+    parser.add_argument("--varlen", action='store_true')
+    parser.add_argument("--num_heads", default=None, type=int)
+    parser.add_argument("--head_dim", default=None, type=int)
+    parser.add_argument("--num_hidden_layers", default=None, type=int)
+    parser.add_argument("--warmup_steps", default=64, type=int)
+    parser.add_argument("--steps", default=256, type=int)
+    parser.add_argument("--compile", action='store_true')
     args = parser.parse_args()
-    profile(args.name, args.batch_size, args.seq_len, args.warmup_steps, args.steps)
+    profile(
+        name=args.name,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        context_len=args.context_len,
+        varlen=args.varlen,
+        num_heads=args.num_heads,
+        head_dim=args.head_dim,
+        num_hidden_layers=args.num_hidden_layers,
+        warmup_steps=args.warmup_steps,
+        steps=args.steps,
+        compile=args.compile,
+    )

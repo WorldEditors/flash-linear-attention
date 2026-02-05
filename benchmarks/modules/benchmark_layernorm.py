@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 import torch
 import torch.nn as nn
@@ -28,10 +27,10 @@ from fla.modules import GroupNorm, LayerNorm
         # name for the plot. Used also as a file name for saving the plot.
         plot_name="Performance",
         args={},
-    )
+    ),
 )
 def benchmark(T, provider):
-    device = 'cuda'
+    from fla.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     B, D = 16, 1024

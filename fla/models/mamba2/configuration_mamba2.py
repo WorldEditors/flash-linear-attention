@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MAMBA2 configuration"""
 
 import math
+import warnings
 
 from transformers.configuration_utils import PretrainedConfig
 
@@ -30,8 +30,6 @@ class Mamba2Config(PretrainedConfig):
 
 
     Args:
-        num_heads (`int`, *optional*, defaults to 64):
-            Number of heads for the evolution matrices of mamba 2.
         head_dim (`int`, *optional*, defaults to 64):
             Dimension of each head.
         vocab_size (`int`, *optional*, defaults to 32768):
@@ -42,7 +40,7 @@ class Mamba2Config(PretrainedConfig):
         state_size (`int`, *optional*, defaults to 128): shape of the state space latents.
         num_hidden_layers (`int`, *optional*, defaults to 48):
             Number of hidden layers in the model.
-        layer_norm_epsilon (`float`, *optional*, defaults to 1e-05):
+        norm_eps (`float`, *optional*, defaults to 1e-05):
             The epsilon to use in the layer normalization layers.
         pad_token_id (`int`, *optional*, defaults to 0):
             Padding token id.
@@ -60,7 +58,7 @@ class Mamba2Config(PretrainedConfig):
             Whether or not to use bias in the convolution layer of the mixer block.
         hidden_act (`str`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
-        initializer_range (`float`, *optional*, defaults to 0.1):
+        initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         residual_in_fp32 (`bool`, *optional*, defaults to `True`):
             Whether or not residuals should be in `float32`.
@@ -92,13 +90,12 @@ class Mamba2Config(PretrainedConfig):
 
     def __init__(
         self,
-        num_heads: int = 64,
         head_dim: int = 64,
         vocab_size: int = 32000,
         hidden_size: int = 2048,
         state_size: int = 128,
         num_hidden_layers: int = 48,
-        layer_norm_epsilon: float = 1e-5,
+        norm_eps: float = 1e-5,
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -108,7 +105,7 @@ class Mamba2Config(PretrainedConfig):
         use_bias: bool = False,
         use_conv_bias: bool = True,
         hidden_act: str = "silu",
-        initializer_range: float = 0.1,
+        initializer_range: float = 0.02,
         residual_in_fp32: bool = True,
         time_step_rank: str = "auto",
         time_step_min: float = 0.001,
@@ -119,7 +116,11 @@ class Mamba2Config(PretrainedConfig):
         use_cache: bool = True,
         rms_norm: bool = True,
         chunk_size: int = 256,
+        use_segment_input: bool = False,
+        fuse_norm: bool = True,
         fuse_cross_entropy: bool = True,
+        fuse_linear_cross_entropy: bool = False,
+        use_l2warp: bool = False,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
@@ -127,7 +128,7 @@ class Mamba2Config(PretrainedConfig):
         self.hidden_size = hidden_size
         self.state_size = state_size
         self.num_hidden_layers = num_hidden_layers
-        self.layer_norm_epsilon = layer_norm_epsilon
+        self.norm_eps = norm_eps
         self.conv_kernel = conv_kernel
         self.expand = expand
 
@@ -150,14 +151,29 @@ class Mamba2Config(PretrainedConfig):
         self.residual_in_fp32 = residual_in_fp32
         self.use_cache = use_cache
         self.n_groups = n_groups
-        self.num_heads = num_heads
         self.head_dim = head_dim
+        self.num_heads = int(self.expand * self.hidden_size / self.head_dim)
         self.rms_norm = rms_norm
         self.state_size = state_size
         self.chunk_size = chunk_size
+        self.use_segment_input = use_segment_input
         self.time_step_limit = time_step_limit
+        self.fuse_norm = fuse_norm
         self.fuse_cross_entropy = fuse_cross_entropy
+        self.fuse_linear_cross_entropy = fuse_linear_cross_entropy
+        self.use_l2warp = use_l2warp
         self.tie_word_embeddings = tie_word_embeddings
+
+        if fuse_cross_entropy and fuse_linear_cross_entropy:
+            raise ValueError(
+                "`fuse_cross_entropy` and `fuse_linear_cross_entropy` cannot be True at the same time.",
+            )
+        if fuse_linear_cross_entropy:
+            warnings.warn(
+                "`fuse_linear_cross_entropy` is enabled, which can improves memory efficiency "
+                "at the potential cost of reduced precision. "
+                "If you observe issues like loss divergence, consider disabling this setting.",
+            )
 
         super().__init__(
             bos_token_id=bos_token_id,
