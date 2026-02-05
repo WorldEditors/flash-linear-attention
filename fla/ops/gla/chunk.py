@@ -328,15 +328,15 @@ def chunk_gla_fwd_kernel_o(
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_tg = i_t
+        i_tg = i_t.to(tl.int64)
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
         NT = tl.cdiv(T, BT)
     else:
         NT = tl.cdiv(T, BT)
-        i_tg = i_b * NT + i_t
-        bos, eos = i_b * T, i_b * T + T
+        i_tg = (i_b * NT + i_t).to(tl.int64)
+        bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
 
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
 
@@ -348,9 +348,8 @@ def chunk_gla_fwd_kernel_o(
 
         # [BT, BK]
         b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_q = (b_q * scale).to(b_q.dtype)
         # [BT, BK]
-        b_g = tl.load(p_g, boundary_check=(0, 1))
+        b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
         # [BT, BK]
         if USE_EXP2:
             b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
@@ -362,6 +361,7 @@ def chunk_gla_fwd_kernel_o(
         # [BT, BV]
         if i_k >= 0:
             b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
+    b_o *= scale
     p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     p_o = tl.make_block_ptr(o + (bos * H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
@@ -873,7 +873,8 @@ def chunk_gla_fwd_o_gk(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    o = torch.empty_like(v)
+    # Please ensure zeros, since vllm will use padding v
+    o = torch.zeros_like(v)
     def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * H)
     chunk_gla_fwd_kernel_o[grid](
         q=q,

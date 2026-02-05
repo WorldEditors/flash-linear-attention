@@ -1,17 +1,25 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Related files are modified and supported by the Moonshot AI Team
 
 import torch
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
-from fla.ops.common.chunk_o import chunk_bwd_dv_local
-from fla.ops.gla.chunk import chunk_gla_bwd_dA, chunk_gla_fwd_o_gk
-from fla.ops.kda.chunk_inter import chunk_kda_bwd_dqkwg
+from fla.ops.cp import FLACPContext
+from fla.ops.cp.chunk_delta_h import (
+    chunk_gated_delta_rule_bwd_dhu_pre_process,
+    chunk_gated_delta_rule_fwd_h_pre_process,
+    compress_h0,
+    expand_h0,
+)
+from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
+from fla.ops.kda.chunk_bwd import chunk_kda_bwd_dAv, chunk_kda_bwd_wy_dqkg_fused
 from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra, chunk_kda_fwd_intra
-from fla.ops.kda.gate import kda_gate_bwd, kda_gate_fwd
-from fla.ops.kda.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
+from fla.ops.kda.gate import kda_gate_bwd, kda_gate_chunk_cumsum
+from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 
@@ -27,8 +35,13 @@ def chunk_kda_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    safe_gate: bool = False,
+    disable_recompute: bool = False,
+    return_intermediate_states: bool = False,
+    cp_context: FLACPContext | None = None,
 ):
-    w, u, kg, Aqk, Akk = chunk_kda_fwd_intra(
+    # qg = None if disable_recompute is False
+    w, u, qg, kg, Aqk, Akk = chunk_kda_fwd_intra(
         q=q,
         k=k,
         v=v,
@@ -38,7 +51,22 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
+        safe_gate=safe_gate,
+        disable_recompute=disable_recompute
     )
+
+    if cp_context is not None:
+        initial_state = chunk_gated_delta_rule_fwd_h_pre_process(
+            k=kg,
+            w=w,
+            u=u,
+            gk=g,
+            cu_seqlens=cu_seqlens,
+            initial_state=initial_state,
+            context=cp_context,
+            use_exp2=True,
+        )
+
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
@@ -50,6 +78,13 @@ def chunk_kda_fwd(
         chunk_indices=chunk_indices,
         use_exp2=True,
     )
+
+    if cp_context is not None:
+        # In Context Parallel (CP) mode, global initial states are not supported at the entry point.
+        # The `initial_state` here is computed internally via inter-rank communication.
+        # Since only the first sequence in the local batch can be a continuation of a cross-rank sequence,
+        # only the first state in the tensor is relevant. We compress it to optimize memory for `save_for_backward`.
+        initial_state = compress_h0(initial_state, context=cp_context)
 
     o = chunk_gla_fwd_o_gk(
         q=q,
@@ -63,7 +98,14 @@ def chunk_kda_fwd(
         chunk_indices=chunk_indices,
         use_exp2=True,
     )
-    return o, Aqk, Akk, final_state
+    if not disable_recompute:
+        # Delete to save memory
+        w, u, qg, kg, v_new = None, None, None, None, None
+        if not return_intermediate_states:
+            # Only delete h if not requested for inference
+            h = None
+
+    return o, Aqk, Akk, final_state, w, u, qg, kg, v_new, h, initial_state
 
 
 def chunk_kda_bwd(
@@ -81,31 +123,51 @@ def chunk_kda_bwd(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    safe_gate: bool = False,
+    disable_recompute: bool = False,
+    cp_context: FLACPContext | None = None,
+    **kwargs,
 ):
-    w, u, qg, kg = recompute_w_u_fwd(
+    if not disable_recompute:
+        # w = Akk @ (k * beta)
+        # u = Akk @ (v * beta)
+        w, u, qg, kg = recompute_w_u_fwd(
+            q=q,
+            k=k,
+            v=v,
+            beta=beta,
+            A=Akk,
+            gk=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        if cp_context is not None:
+            # Restore the full initial_state tensor from the compressed version.
+            # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
+            initial_state = expand_h0(initial_state, context=cp_context)
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=u,
+            gk=g,
+            initial_state=initial_state,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+        )
+    else:
+        w, u, qg, kg, v_new, h = kwargs["w"], kwargs["u"], kwargs["qg"], kwargs["kg"], kwargs["v_new"], kwargs["h"]
+        if cp_context is not None:
+            # Restore the full initial_state tensor from the compressed version.
+            # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
+            initial_state = expand_h0(initial_state, context=cp_context)
+    # dAqk = do @ v.T
+    # dv = A @ do
+    dAqk, dv = chunk_kda_bwd_dAv(
         q=q,
         k=k,
-        v=v,
-        beta=beta,
-        A=Akk,
-        gk=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
-    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
-        k=kg,
-        w=w,
-        u=u,
-        gk=g,
-        initial_state=initial_state,
-        output_final_state=False,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
-    )
-    dv = chunk_bwd_dv_local(
-        q=q,
-        k=k,
+        v=v_new,
         do=do,
         A=Aqk,
         scale=scale,
@@ -113,6 +175,24 @@ def chunk_kda_bwd(
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
     )
+
+    if cp_context is not None:
+        # initial_state is None in the CP mode
+        # We only need to compute dht of current rank and pass it to the backward kernel
+        dht, initial_state = chunk_gated_delta_rule_bwd_dhu_pre_process(
+            q=qg,
+            k=kg,
+            w=w,
+            do=do,
+            dv=dv,
+            gk=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            dht=dht,
+            initial_state=initial_state,
+            use_exp2=True,
+            context=cp_context,
+        )
 
     dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu(
         q=qg,
@@ -128,43 +208,24 @@ def chunk_kda_bwd(
         chunk_indices=chunk_indices,
         use_exp2=True,
     )
-    # dq dk in fp32
-    dAqk = chunk_gla_bwd_dA(
-        v=v_new,
-        do=do,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-    )
-    dq, dk, dw, dg = chunk_kda_bwd_dqkwg(
+    dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(
         q=q,
         k=k,
-        v=v_new,
-        w=w,
+        v=v,
+        v_new=v_new,
         g=g,
+        beta=beta,
+        A=Akk,
         h=h,
-        dv=dv,
         do=do,
         dh=dh,
+        dv=dv,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
     )
-    dk, dv, db, dg, dAkk = prepare_wy_repr_bwd(
-        k=k,
-        v=v,
-        beta=beta,
-        gk=g,
-        A=Akk,
-        dk=dk,
-        dw=dw,
-        du=dv,
-        dg=dg,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+
     dq, dk, db, dg = chunk_kda_bwd_intra(
         q=q,
         k=k,
@@ -179,6 +240,7 @@ def chunk_kda_bwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
+        safe_gate=safe_gate
     )
     return dq, dk, dv, db, dg, dh0
 
@@ -202,30 +264,45 @@ class ChunkKDAFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         use_gate_in_kernel: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
-        chunk_indices: torch.LongTensor | None = None,
+        cu_seqlens_cpu: torch.LongTensor | None = None,
+        safe_gate: bool = False,
+        lower_bound: float | None = None,
+        disable_recompute: bool = False,
+        return_intermediate_states: bool = False,
+        cp_context: FLACPContext | None = None,
     ):
+        chunk_size = 64
         g_org = None
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
         if use_gate_in_kernel:
             g_org = g
-            g = kda_gate_fwd(
+            if safe_gate:
+                assert lower_bound is not None, "lower_bound must be set when use safe_gate"
+            g = kda_gate_chunk_cumsum(
                 g=g_org,
                 A_log=A_log,
                 dt_bias=dt_bias,
+                scale=RCP_LN2,
+                chunk_size=chunk_size,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                lower_bound=lower_bound,
+            )
+        else:
+            g = chunk_local_cumsum(
+                g=g,
+                scale=RCP_LN2,
+                chunk_size=chunk_size,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices
             )
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
 
-        chunk_size = 64
-        g = chunk_local_cumsum(
-            g=g,
-            chunk_size=chunk_size,
-            scale=RCP_LN2,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices
-        )
-        o, Aqk, Akk, final_state = chunk_kda_fwd(
+        (o, Aqk, Akk, final_state, w, u, qg, kg, v_new, h, initial_state) = chunk_kda_fwd(
             q=q,
             k=k,
             v=v,
@@ -236,16 +313,31 @@ class ChunkKDAFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            safe_gate=safe_gate,
+            disable_recompute=disable_recompute,
+            return_intermediate_states=return_intermediate_states,
+            cp_context=cp_context,
         )
-        if use_gate_in_kernel:
-            g = None
+        if return_intermediate_states:
+            assert torch.is_inference_mode_enabled(), "return_intermediate_states is only allowed in inference mode"
+            assert disable_recompute is False, "return_intermediate_states must be used with disable_recompute=False"
+            return o.to(q.dtype), final_state, h
+
+        if disable_recompute is False and use_gate_in_kernel:
+            g = None  # type: ignore
         ctx.save_for_backward(
-            q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, Akk, initial_state, cu_seqlens, chunk_indices
+            q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, Akk,
+            w, u, qg, kg, v_new, h,
+            initial_state, cu_seqlens, chunk_indices
         )
         ctx.chunk_size = chunk_size
+        ctx.safe_gate = safe_gate
         ctx.scale = scale
+        ctx.lower_bound = lower_bound
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.use_gate_in_kernel = use_gate_in_kernel
+        ctx.disable_recompute = disable_recompute
+        ctx.cp_context = cp_context
         return o.to(q.dtype), final_state
 
     @staticmethod
@@ -256,21 +348,21 @@ class ChunkKDAFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor,
     ):
-        (q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, Akk, initial_state, cu_seqlens, chunk_indices) = (
+        (q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, Akk,
+         w, u, qg, kg, v_new, h,
+         initial_state, cu_seqlens, chunk_indices) = (
             ctx.saved_tensors
         )
-        if ctx.use_gate_in_kernel:
-            g = kda_gate_fwd(
+        if ctx.disable_recompute is False and ctx.use_gate_in_kernel:
+            g = kda_gate_chunk_cumsum(
                 g=g_org,
                 A_log=A_log,
                 dt_bias=dt_bias,
-            )
-            g = chunk_local_cumsum(
-                g=g,
-                chunk_size=ctx.chunk_size,
                 scale=RCP_LN2,
+                chunk_size=ctx.chunk_size,
                 cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices
+                chunk_indices=chunk_indices,
+                lower_bound=ctx.lower_bound
             )
         dq, dk, dv, db, dg, dh0 = chunk_kda_bwd(
             q=q,
@@ -287,23 +379,41 @@ class ChunkKDAFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_size=ctx.chunk_size,
+            safe_gate=ctx.safe_gate,
+            disable_recompute=ctx.disable_recompute,
+            w=w, u=u, qg=qg, kg=kg, v_new=v_new, h=h,
+            cp_context=ctx.cp_context,
         )
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
         dA, dbias = None, None
+
         if ctx.use_gate_in_kernel:
+            dg = chunk_local_cumsum(
+                dg,
+                chunk_size=ctx.chunk_size,
+                reverse=True,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+            )
             dg, dA, dbias = kda_gate_bwd(
                 g=g_org,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 dyg=dg,
-                dyb=db,
+                lower_bound=ctx.lower_bound
             )
-            dA = dA.to(A_log)
-            if dt_bias is not None:
-                dbias = dbias.to(dt_bias)
-        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), dA, dbias, None, dh0, None, None, None, None, None
+        else:
+            dg = chunk_local_cumsum(
+                dg,
+                chunk_size=ctx.chunk_size,
+                reverse=True,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+            )
+        return (dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), dA, dbias, None, dh0,
+                None, None, None, None, None, None, None, None, None, None)
 
 
 @torch.compiler.disable
@@ -313,13 +423,18 @@ def chunk_kda(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: float = None,
-    initial_state: torch.Tensor = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     use_gate_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    safe_gate: bool = False,
+    lower_bound: float | None = None,
+    disable_recompute: bool = False,
+    return_intermediate_states: bool = False,
+    cp_context: FLACPContext = None,
     **kwargs,
 ):
     r"""
@@ -356,14 +471,41 @@ def chunk_kda(
         cu_seqlens (torch.LongTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
-        chunk_indices (torch.LongTensor):
-            Chunk indices used for variable-length training,
+        cu_seqlens_cpu (torch.LongTensor):
+            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
+            consistent with the FlashAttention API.
+        safe_gate (bool):
+            Whether the kernel can assume the input gate values `g` are in a safe range.
+            When `True`, the kernel can use M=16 TensorCore acceleration.
+            The safe range is approximately [-5, 0). Default: `False`.
+        lower_bound (Optional[float]):
+            Lower bound for the forget gate activation function when `use_gate_in_kernel=True`.
+            This parameter modifies the internal forget gate activation and is recommended
+            to be set to `-5` when `safe_gate` is enabled. Default: `None`.
+        disable_recompute (bool):
+            Whether to disable gradient recomputation in the kernel. When `True`, the kernel
+            will save all intermediate activations for backward pass, which is beneficial
+            for training small models at the cost of increased memory usage. Default: `False`.
+        return_intermediate_states (bool):
+            If True, returns intermediate state `h` for inference scenarios (e.g., vLLM).
+            Must be used within `torch.inference_mode()` and will return a 3-tuple instead of 2-tuple.
+            This is not intended for training as it bypasses autograd. Default: `False`.
 
     Returns:
-        o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]`.
-        final_state (torch.Tensor):
-            Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+        - Normal mode (return_intermediate_states=False): A tuple (o, final_state)
+            o (torch.Tensor):
+                Outputs of shape `[B, T, H, V]`.
+            final_state (torch.Tensor):
+                Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+        - Inference mode (return_intermediate_states=True): A tuple (o, final_state, h)
+            o (torch.Tensor):
+                Outputs of shape `[B, T, H, V]`.
+            final_state (torch.Tensor):
+                Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+            h (torch.Tensor):
+                Intermediate states of shape `[B, NT, H, K, V]` and dtype `bfloat16` for caching or further processing.
+                - For equal-length sequences: `NT = #chunks_per_sequence` (typically `ceil(T / chunk_size)`)
+                - For variable-length sequences (cu_seqlens): B is always 1 (flattened), NT is the total number of chunks across all sequences, determined by `prepare_chunk_indices(cu_seqlens, chunk_size)`
 
     Examples::
         >>> import torch
@@ -405,6 +547,15 @@ def chunk_kda(
         )
     """
 
+    if cp_context is not None:
+        assert initial_state is None, "Initial state is not supported for CP"
+        assert output_final_state is False, "Output final state is not supported for CP"
+        assert cp_context.cu_seqlens is not None, "cu_seqlens is required for CP"
+        # Override cu_seqlens and cu_seqlens_cpu with the ones from the context
+        cu_seqlens = cp_context.cu_seqlens
+        if cp_context.cu_seqlens_cpu is not None:
+            cu_seqlens_cpu = cp_context.cu_seqlens_cpu
+
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
@@ -423,13 +574,20 @@ def chunk_kda(
     if use_gate_in_kernel:
         assert "A_log" in kwargs, "A_log must be provided when use_gate_in_kernel=True."
         A_log, dt_bias = kwargs["A_log"], kwargs.get("dt_bias")
+        if safe_gate:
+            if lower_bound is None:
+                raise ValueError("`lower_bound` must be specified when `safe_gate=True` and `use_gate_in_kernel=True`.")
+            if not (-5 <= lower_bound < 0):
+                raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
 
     assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
+    assert k.shape[-1] <= 256, "Currently we only support key headdim <=256 for KDA :-("
     assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
     assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
+
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = ChunkKDAFunction.apply(
+    return ChunkKDAFunction.apply(
         q,
         k,
         v,
@@ -443,6 +601,10 @@ def chunk_kda(
         use_qk_l2norm_in_kernel,
         use_gate_in_kernel,
         cu_seqlens,
-        chunk_indices,
+        cu_seqlens_cpu,
+        safe_gate,
+        lower_bound,
+        disable_recompute,
+        return_intermediate_states,
+        cp_context,
     )
-    return o, final_state
